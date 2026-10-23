@@ -1,0 +1,149 @@
+"""Qzone protocol helpers adapted from Zhalslar/astrbot_plugin_qzone v3.1.3.
+
+Copyright remains with the upstream contributors; GPL-3.0.
+This derivative retains only the protocol required by Qzone Life and uses
+plain dictionaries instead of AstrBot-dependent models. See the notices file.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass(frozen=True)
+class Credentials:
+    uin: int
+    skey: str
+    p_skey: str
+
+    @property
+    def gtk(self) -> str:
+        value = 5381
+        for character in self.p_skey:
+            value += (value << 5) + ord(character)
+        return str(value & 0x7FFFFFFF)
+
+    def cookies(self) -> dict[str, str]:
+        return {"uin": f"o{self.uin}", "skey": self.skey, "p_skey": self.p_skey}
+
+    def headers(self) -> dict[str, str]:
+        return {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36",
+            "Referer": f"https://user.qzone.qq.com/{self.uin}",
+            "Origin": "https://user.qzone.qq.com",
+        }
+
+
+def parse_response(text: str) -> dict[str, Any]:
+    """Read JSON/JSONP without evaluating JavaScript or logging response secrets."""
+    if not text or not text.strip():
+        return {"code": -1, "message": "空间返回空响应", "_parse_error": True}
+    begin, end = text.find("{"), text.rfind("}")
+    if begin < 0 or end < begin:
+        return {"code": -1, "message": "空间响应格式无法识别", "_parse_error": True}
+    value = text[begin : end + 1]
+    try:
+        parsed = json.loads(value)
+    except (ValueError, TypeError):
+        try:
+            import json5
+
+            # Upstream CGI occasionally returns the JavaScript undefined token.
+            value = re.sub(r"(?<=[\[:,])\s*undefined(?=\s*[,}\]])", "null", value)
+            parsed = json5.loads(value)
+        except (ImportError, ValueError, TypeError):
+            return {"code": -1, "message": "空间响应无法解析", "_parse_error": True}
+    if not isinstance(parsed, dict):
+        return {"code": -1, "message": "空间响应不是对象", "_parse_error": True}
+    return parsed
+
+
+def number(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def result_code(raw: dict[str, Any]) -> int | None:
+    value = raw.get("code", raw.get("ret"))
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def upload_fields(raw: dict[str, Any]) -> tuple[str, str]:
+    data = raw.get("data")
+    if not isinstance(data, dict):
+        raise ValueError("图片上传响应缺少图片信息")
+    url = str(data.get("url") or "")
+    if "&bo=" not in url:
+        raise ValueError("图片上传响应缺少图片标识")
+    required = ("albumid", "lloc", "sloc", "type", "height", "width")
+    if any(key not in data for key in required):
+        raise ValueError("图片上传响应不完整")
+    richval = ",{},{},{},{},{},{},,{},{}".format(
+        data["albumid"],
+        data["lloc"],
+        data["sloc"],
+        data["type"],
+        data["height"],
+        data["width"],
+        data["height"],
+        data["width"],
+    )
+    return url.split("&bo=", 1)[1], richval
+
+
+def comment_from_raw(
+    raw: dict[str, Any],
+    parent_id: str | None = None,
+    parent_uin: int | None = None,
+) -> dict[str, Any]:
+    identifier = str(raw.get("tid") or raw.get("id") or "")
+    if identifier == "0":
+        identifier = ""
+    return {
+        "id": identifier,
+        "uin": number(raw.get("uin")),
+        "nickname": str(raw.get("name") or raw.get("nickname") or ""),
+        "content": str(raw.get("content") or ""),
+        "created_at": number(raw.get("create_time", raw.get("created_time"))),
+        "parent_id": parent_id,
+        "parent_uin": parent_uin,
+    }
+
+
+def post_from_raw(raw: dict[str, Any], *, tid: str = "", uin: int = 0) -> dict[str, Any]:
+    comments: list[dict[str, Any]] = []
+    for main in raw.get("commentlist") or []:
+        if not isinstance(main, dict):
+            continue
+        parent = comment_from_raw(main)
+        comments.append(parent)
+        for child in main.get("list_3") or []:
+            if isinstance(child, dict):
+                # A missing root id remains an empty string, never becomes a
+                # top-level comment by accident. reply() refuses that route.
+                comments.append(comment_from_raw(child, parent["id"], parent["uin"]))
+    images: list[str] = []
+    for picture in raw.get("pic") or []:
+        if not isinstance(picture, dict):
+            continue
+        source = next(
+            (picture[key] for key in ("url2", "url3", "url1", "smallurl") if picture.get(key)), None
+        )
+        if source:
+            images.append(str(source))
+    return {
+        "tid": str(raw.get("tid") or tid),
+        "uin": number(raw.get("uin"), uin),
+        "text": str(raw.get("content") or ""),
+        "created_at": number(raw.get("created_time", raw.get("create_time"))),
+        "comments": comments,
+        "images": images,
+    }

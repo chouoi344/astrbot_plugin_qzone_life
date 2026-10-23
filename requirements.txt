@@ -1,0 +1,4 @@
+aiohttp>=3.13.2,<4
+Pillow>=10,<14
+json5>=0.9,<1
+tzdata>=2025.1
