@@ -11,6 +11,7 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 
 @dataclass(frozen=True)
@@ -63,10 +64,18 @@ def parse_response(text: str) -> dict[str, Any]:
                 ):
                     return parsed
         return {"code": -1, "message": "空间响应无法解析", "_parse_error": True}
-    begin, end = text.find("{"), text.rfind("}")
-    if begin < 0 or end < begin:
+    value = text.strip().lstrip("\ufeff").strip()
+    if not (value.startswith("{") and value.endswith("}")):
+        callback = re.fullmatch(
+            r"(?:[A-Za-z_$][\w$]*\.)*[A-Za-z_$][\w$]*\s*\(\s*(\{.*\})\s*\)\s*;?",
+            value,
+            re.DOTALL,
+        )
+        if callback is None:
+            return {"code": -1, "message": "空间响应格式无法识别", "_parse_error": True}
+        value = callback[1]
+    if not value:
         return {"code": -1, "message": "空间响应格式无法识别", "_parse_error": True}
-    value = text[begin : end + 1]
     try:
         parsed = json.loads(value)
     except (ValueError, TypeError):
@@ -74,7 +83,13 @@ def parse_response(text: str) -> dict[str, Any]:
             import json5
 
             # Upstream CGI occasionally returns the JavaScript undefined token.
-            value = re.sub(r"(?<=[\[:,])\s*undefined(?=\s*[,}\]])", "null", value)
+            # Protect quoted user content before replacing bare JS values.
+            value = re.sub(
+                r'''("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|(?<=[\[:,])\s*undefined(?=\s*[,}\]])''',
+                lambda match: match[1] if match[1] is not None else "null",
+                value,
+                flags=re.DOTALL,
+            )
             parsed = json5.loads(value)
         except (ImportError, ValueError, TypeError):
             return {"code": -1, "message": "空间响应无法解析", "_parse_error": True}
@@ -103,7 +118,14 @@ def upload_fields(raw: dict[str, Any]) -> tuple[str, str]:
     if not isinstance(data, dict):
         raise ValueError("图片上传响应缺少图片信息")
     url = str(data.get("url") or "")
-    if "&bo=" not in url:
+    tokens = []
+    for field in urlsplit(url).query.split("&"):
+        key, separator, value = field.partition("=")
+        if unquote(key) == "bo":
+            tokens.append(unquote(value) if separator else "")
+    # Qzone's token can contain a literal '+'. Form-style unquote_plus would
+    # turn it into a space; only percent-decode this URL component.
+    if len(tokens) != 1 or not tokens[0].strip():
         raise ValueError("图片上传响应缺少图片标识")
     required = ("albumid", "lloc", "sloc", "type", "height", "width")
     if any(key not in data for key in required):
@@ -118,7 +140,7 @@ def upload_fields(raw: dict[str, Any]) -> tuple[str, str]:
         data["height"],
         data["width"],
     )
-    return url.split("&bo=", 1)[1], richval
+    return tokens[0], richval
 
 
 def comment_from_raw(
