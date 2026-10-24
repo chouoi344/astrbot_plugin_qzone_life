@@ -9,16 +9,22 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from types import ModuleType, SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from astrbot_plugin_qzone_life.core import service as service_module
 from astrbot_plugin_qzone_life.core.planning import parse_schedule, schedule_hash, select_slots
 from astrbot_plugin_qzone_life.core.store import StateStore
 from astrbot_plugin_qzone_life.core.transport import QzoneReadError
+
+# These workflow tests run without the AstrBot host. Only the import receives a
+# scoped API double; production always imports the host's official logger.
+_test_api = ModuleType("astrbot.api")
+_test_api.logger = Mock()
+with patch.dict(sys.modules, {"astrbot": ModuleType("astrbot"), "astrbot.api": _test_api}):
+    from astrbot_plugin_qzone_life.core import service as service_module
 
 
 class FakeEvent:
@@ -733,6 +739,21 @@ class ServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.facts["action"], "delete")
         self.assertIn("尚未确认", response.facts["result"])
         self.transport.list_posts.assert_not_awaited()
+
+    async def test_background_failure_uses_host_logger_and_remains_silent(self):
+        failure = RuntimeError("temporary service failure")
+
+        async def fail_once():
+            self.service._stop.set()
+            raise failure
+
+        with patch.object(self.service, "tick", side_effect=fail_once), patch.object(
+            service_module, "logger"
+        ) as host_logger:
+            await self.service.loop()
+        host_logger.warning.assert_called_once_with("QQ空间后台任务等待恢复：%s", failure)
+        self.assertEqual(self.store.get_value("last_background_error"), str(failure))
+        self.transport.publish.assert_not_awaited()
 
 
 if __name__ == "__main__":
