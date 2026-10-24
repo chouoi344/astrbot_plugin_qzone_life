@@ -10,9 +10,10 @@ import asyncio
 import importlib
 import inspect
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 
 class IntegrationError(RuntimeError):
@@ -145,6 +146,8 @@ class Integrations:
         getter = getattr(peer, "get_life_context", None)
         if not callable(getter):
             raise IntegrationIncompatible("日程插件缺少 get_life_context 接口")
+        generator = getattr(peer, "generator", None)
+        generation_started = getattr(generator, "_generating", False) is True
         try:
             result = await _await(getter(allow_generate=False))
         except TypeError as exc:
@@ -152,7 +155,68 @@ class Integrations:
             raise IntegrationIncompatible("日程插件不支持只读日程查询") from exc
         if not isinstance(result, dict):
             raise IntegrationIncompatible("日程插件返回的数据格式不兼容")
-        return result
+        if not result:
+            return result
+        config = getattr(peer, "config", None)
+        manager = getattr(peer, "data_mgr", None)
+        # Older/fake peers may expose only the public read-only method. Preserve
+        # that contract; Life Scheduler 2.8 adds a readable, dated cache.
+        if not callable(getattr(config, "get", None)) or not callable(
+            getattr(manager, "get", None)
+        ):
+            return result
+        utils = _peer_module(peer, "core.utils")
+        resolve = getattr(utils, "resolve_business_now", None)
+        parse_time = getattr(utils, "parse_schedule_time", None)
+        if not callable(resolve) or not callable(parse_time):
+            raise IntegrationIncompatible("日程插件缺少业务日期接口")
+        zone = getattr(getattr(peer, "scheduler", None), "timezone", None)
+        if zone is None:
+            getter = getattr(self.context, "get_config", None)
+            host_config = getter() if callable(getter) else {}
+            zone = ZoneInfo((host_config or {}).get("timezone") or "Asia/Shanghai")
+        elif isinstance(zone, str):
+            zone = ZoneInfo(zone)
+        now = datetime.now(zone)
+        schedule_time = config.get("schedule_time")
+        business_now = resolve(schedule_time, now=now)
+        data = await _await(manager.get(business_now))
+        if data is None:
+            # A refresh boundary may have crossed during the public read.
+            return {}
+        data_field = (
+            data.get
+            if isinstance(data, dict)
+            else lambda key, default=None: getattr(data, key, default)
+        )
+        source_day = str(data_field("date", ""))
+        if not source_day:
+            return result
+        if source_day != str(business_now.date()):
+            return {}
+        # Do not attach a newer cache date to an older snapshot or extend a
+        # removed/changed schedule while the upstream refresh is in progress.
+        for field in ("schedule", "outfit"):
+            cached = data_field(field)
+            if field in result and cached is not None and str(result[field]) != str(cached):
+                return {}
+        hour, minute = parse_time(schedule_time)
+        boundary = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if boundary <= now:
+            boundary += timedelta(days=1)
+        meta = result.get("meta", {})
+        if not isinstance(meta, dict):
+            raise IntegrationIncompatible("日程插件返回的元数据格式不兼容")
+        return {
+            **result,
+            "meta": {
+                **meta,
+                "qzone_schedule_day": source_day,
+                "qzone_valid_until": boundary.timestamp(),
+                "qzone_generation_in_progress": generation_started
+                or getattr(generator, "_generating", False) is True,
+            },
+        }
 
     async def check_life_persona(self, binding: dict[str, Any]) -> None:
         """Life Scheduler 2.8 reads the global default, not the bound chat persona."""
@@ -362,7 +426,7 @@ class Integrations:
             return "\n".join(facts), facts
         if kind == "delete":
             facts = [
-                f"{role}于{when}删除了自己的{post_label}（ID：{tid}），该说说现在已不存在。",
+                f"{role}此前发布的{post_label}（ID：{tid}）已于{when}从该QQ账号的空间删除，现已不存在。",
                 f"这是删除前的历史文案：{content}",
             ]
             return "\n".join(facts), facts

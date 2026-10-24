@@ -56,7 +56,7 @@ class FakeIntegrations:
     def __init__(self, binding, photo):
         self.binding = copy.deepcopy(binding)
         self.life = {
-            "schedule": "12:00 在咖啡店休息\n18:00 在公园散步",
+            "schedule": "11:00-17:00 咖啡店休息\n18:00-20:00 公园散步",
             "outfit": "蓝色外套",
             "meta": {},
         }
@@ -127,6 +127,7 @@ class ServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 self_id=binding["bot_id"],
             ),
         )
+        self.service.settings.daily_min = self.service.settings.daily_max = 2
         self.service.now = lambda: self.now
         self.service.photo_summary = AsyncMock(return_value="蓝色外套，咖啡店")
         self.service.llm = AsyncMock(return_value="今天在咖啡店休息。")
@@ -194,7 +195,10 @@ class ServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
     def seed_due_plan(self, plan_id, seconds_ago):
         fingerprint = schedule_hash(self.integrations.life)
-        self.store.set_value(f"plan_fingerprint:{self.now.date()}", fingerprint)
+        self.store.set_value(
+            f"plan_fingerprint:{self.now.date()}",
+            self.service.plan_fingerprint(self.integrations.life),
+        )
         return self.store.save_plan(
             {
                 "plan_id": plan_id,
@@ -209,7 +213,10 @@ class ServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
     def seed_short_activity_plan(self):
         self.integrations.life["schedule"] = "12:00-12:10 咖啡店休息"
         fingerprint = schedule_hash(self.integrations.life)
-        self.store.set_value(f"plan_fingerprint:{self.now.date()}", fingerprint)
+        self.store.set_value(
+            f"plan_fingerprint:{self.now.date()}",
+            self.service.plan_fingerprint(self.integrations.life),
+        )
         plans = select_slots(
             parse_schedule(self.integrations.life["schedule"]),
             self.now.replace(hour=11, minute=59),
@@ -241,9 +248,44 @@ class ServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("sent-post", response)
         self.assertEqual(self.store.count_autonomous(str(self.now.date())), 0)
         self.assertEqual(self.store.get_post("sent-post")["source"], "manual")
-        self.transport.publish.assert_awaited_once_with("用户指定文案", [str(self.photo)])
+        self.assertEqual(
+            self.transport.publish.await_args.args, ("用户指定文案", [str(self.photo)])
+        )
+        self.assertTrue(callable(self.transport.publish.await_args.kwargs["before_publish"]))
         self.transport.like.assert_awaited_once_with("sent-post")
         self.assertEqual(self.integrations.sync_memory.await_args.args[1]["kind"], "publish")
+
+    async def test_zero_autonomous_limit_preserves_manual_self_like_and_admin_replies(self):
+        self.service.settings.daily_min = self.service.settings.daily_max = 0
+        await self.service.publish_from_chat(self.event, "用户指定文案")
+        self.transport.publish.assert_awaited_once()
+        self.transport.like.assert_awaited_once_with("sent-post")
+        self.seed_post("comment-post")
+        self.remote_details["comment-post"]["comments"] = [self.comment()]
+        await self.service.poll_comments(self.event, self.binding)
+        self.transport.reply.assert_awaited_once()
+        self.assertEqual(self.store.count_autonomous(str(self.now.date())), 0)
+        self.assertFalse(self.store.get_value("paused", False))
+
+    async def test_service_uses_text_choice_and_system_vision_as_separate_routes(self):
+        self.service.settings.llm_provider_id = "space-text"
+        self.service.settings.vision_provider_id = "obsolete-plugin-vision"
+        config = {
+            **self.context.config,
+            "provider_settings": {"default_image_caption_provider_id": "system-image"},
+        }
+        self.context.get_config = lambda **kwargs: config
+        self.context.get_provider_by_id = lambda provider_id: SimpleNamespace(text_chat=AsyncMock())
+        self.context.llm_generate = AsyncMock(return_value=SimpleNamespace(completion_text="模型内容"))
+        await service_module.QzoneService.llm(self.service, self.event, "写文案")
+        await service_module.QzoneService.llm(
+            self.service, self.event, "看照片", images=[str(self.photo)], persona=False,
+        )
+        text_call, image_call = self.context.llm_generate.await_args_list
+        self.assertEqual(text_call.kwargs["chat_provider_id"], "space-text")
+        self.assertIn("固定角色", text_call.kwargs["system_prompt"])
+        self.assertEqual(image_call.kwargs["chat_provider_id"], "system-image")
+        self.assertEqual(image_call.kwargs["image_urls"], [str(self.photo)])
 
     async def test_memory_failure_and_message_replay_never_republish(self):
         self.integrations.sync_memory.side_effect = RuntimeError("memory offline")
@@ -516,6 +558,181 @@ class ServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(post["source"], "manual")
         self.assertEqual(post["content"], "唯一的原始文案")
         self.assertTrue(post.get("memory_id"))
+
+    async def test_unknown_publish_blocks_new_message_and_natural_retry(self):
+        self.transport.publish.return_value = self.result(status="unknown")
+        await self.service.publish_from_chat(self.event, "照片")
+        second = FakeEvent(self.bot, message_id="new-message")
+        response = await self.service.publish_from_chat(second, "照片")
+        self.assertEqual(response.status, "uncertain")
+        response = await self.service.retry_last_publish(second)
+        self.assertEqual(response.status, "uncertain")
+        self.transport.publish.assert_awaited_once()
+
+    async def test_natural_retry_reuses_failed_original_key_image_and_caption(self):
+        self.transport.publish.return_value = self.result(status="rejected")
+        await self.service.publish_from_chat(self.event, "第一次原文")
+        original = self.store.list_operations(status="failed")[0]
+        self.transport.publish.return_value = self.result(tid="retry-post")
+        self.service.llm.reset_mock()
+        await self.service.retry_last_publish(FakeEvent(self.bot, message_id="retry"))
+        self.assertEqual(self.transport.publish.await_args.args, ("第一次原文", [str(self.photo)]))
+        self.service.llm.assert_not_awaited()
+        self.assertEqual(self.store.get_operation(original["key"])["status"], "done")
+        self.assertEqual(len(self.store.list_operations()), 1)
+
+    async def test_publish_uses_persisted_draft_instead_of_new_arguments(self):
+        self.transport.publish.return_value = self.result(status="rejected")
+        await self.service.publish_from_chat(self.event, "原图原文")
+        operation = self.store.list_operations(status="failed")[0]
+        self.transport.publish.return_value = self.result(tid="original")
+        await self.service._publish(
+            self.event,
+            {"bot_id": "wrong"},
+            "新文案",
+            ["missing"],
+            "新摘要",
+            "autonomous",
+            operation["key"],
+        )
+        self.assertEqual(self.transport.publish.await_args.args, ("原图原文", [str(self.photo)]))
+        post = self.store.get_post("original")
+        self.assertEqual(post["source"], "manual")
+        self.assertEqual(post["image_summary"], "蓝色外套，咖啡店")
+
+    async def test_removed_admin_during_delete_list_refresh_prevents_delete(self):
+        self.seed_post()
+
+        async def revoked(*args, **kwargs):
+            self.context.config["admins_id"] = []
+            return []
+
+        self.transport.list_posts.side_effect = revoked
+        with self.assertRaises(PermissionError):
+            await self.service.delete_post(self.event, "刚才那条")
+        self.transport.delete.assert_not_awaited()
+        self.assertEqual(self.store.get_post("post-1")["status"], "published")
+
+    async def test_permission_change_after_upload_prevents_final_publish(self):
+        async def upload_then_check(text, images, *, before_publish):
+            self.context.config["admins_id"] = []
+            try:
+                await before_publish()
+            except PermissionError:
+                return self.result(status="rejected", stage="preflight")
+            self.fail("Final permission check passed after removal")
+
+        self.transport.publish.side_effect = upload_then_check
+        response = await self.service.publish_from_chat(self.event, "文案")
+        self.assertEqual(response.status, "failed")
+        self.assertEqual(self.store.list_posts(), [])
+
+    async def test_explicit_rebind_follows_current_persona(self):
+        self.integrations.binding["persona_id"] = "new-role"
+        response = await self.service.bind(self.event)
+        self.assertEqual(response.status, "done")
+        self.assertEqual(self.store.get_value("binding")["persona_id"], "new-role")
+
+    async def test_self_like_revalidates_permission_and_defers_on_pause(self):
+        self.seed_post()
+        self.context.config["admins_id"] = []
+        await self.service.process_outbox()
+        self.transport.like.assert_not_awaited()
+        self.assertNotEqual(self.store.get_outbox("qzone:99:post-1:self_like")["status"], "done")
+
+    async def test_post_choice_resolves_the_displayed_order(self):
+        self.seed_post("older", seconds_ago=120)
+        self.seed_post("newer", seconds_ago=60)
+        response = await self.service.list_posts(self.event)
+        self.assertNotIn("newer", str(response.facts))
+        await self.service.delete_post(self.event, "第二条")
+        self.transport.delete.assert_awaited_once_with("older")
+
+    async def test_pause_control_is_immediate_while_background_work_holds_lock(self):
+        async with self.service._lock:
+            response = self.service.control(self.event, "pause")
+            self.assertEqual(response.status, "done")
+            self.assertTrue(self.store.get_value("paused"))
+
+    async def test_slider_change_replans_without_reusing_cancelled_plan_ids(self):
+        self.service.settings.daily_min = 1
+        identities = []
+        for limit in (1, 2, 1):
+            self.service.settings.daily_max = limit
+            await self.service.ensure_plan(self.event, self.binding)
+            pending = {
+                p["plan_id"]
+                for p in self.store.list_plans(str(self.now.date()))
+                if p["status"] == "pending"
+            }
+            self.assertTrue(pending)
+            self.assertTrue(all(not pending.intersection(old) for old in identities))
+            identities.append(pending)
+        self.transport.publish.assert_not_awaited()
+
+    async def test_ambiguous_schedule_is_skipped_without_model_inventing_time_ranges(self):
+        self.integrations.life["schedule"] = "空下来再喝咖啡，今天没有明确时间安排。"
+        await self.service.run_autonomous(self.event, self.binding)
+        self.service.llm.assert_not_awaited()
+        self.integrations.selfie.assert_not_awaited()
+        self.assertEqual(self.store.list_plans(str(self.now.date())), [])
+
+    def test_confirmation_requires_whole_current_message_and_excludes_negation(self):
+        Plain = type("Plain", (), {})
+
+        def confirm(text, quote, outcome):
+            part = Plain()
+            part.text = text
+            event = SimpleNamespace(get_messages=lambda: [part])
+            return self.service._explicit_confirmation(event, quote, outcome)
+
+        for text in ("我确认还没有删除成功", "我确认没有发布成功", "我确认未回复成功"):
+            self.assertFalse(confirm(text, text, "已成功"))
+            self.assertTrue(confirm(text, text, "未成功"))
+        for text, quote in (
+            ("我没有确认已经发了", "确认已经发了"),
+            ("他说明确我确认已经发了", "我确认已经发了"),
+            ("我确认发出去了吗", "我确认发出去了吗"),
+        ):
+            self.assertFalse(confirm(text, quote, "已成功"))
+        self.assertTrue(confirm("我确认已经发了", "我确认已经发了", "已成功"))
+        self.assertFalse(confirm("我确认已经发了", "我确认已经发了", "未成功"))
+        self.assertTrue(
+            confirm("我确认刚才那条已经发出去了", "我确认刚才那条已经发出去了", "已成功")
+        )
+        self.assertTrue(
+            confirm("我确认刚才那条确实没发出去", "我确认刚才那条确实没发出去", "未成功")
+        )
+        for text in (
+            "我确认没有发错，已经发出去了",
+            "我确认没删错，那条已经删了",
+            "我确认不是没发出去",
+            "我没有确认没发出去",
+        ):
+            self.assertFalse(confirm(text, text, "未成功"))
+
+    async def test_inflight_operation_is_reported_as_in_progress(self):
+        self.store.begin_operation(
+            "working", "publish", {"post": {"binding": self.binding, "content": "原文"}}
+        )
+        response = self.service.unresolved_for_chat(self.event)
+        self.assertEqual(len(response.facts["pending"]), 1)
+        response = await self.service.check_pending(self.event)
+        self.assertEqual(response.status, "uncertain")
+        self.assertIn("仍在处理", response.facts["result"])
+        self.transport.list_posts.assert_not_awaited()
+
+    async def test_delete_check_does_not_claim_remote_inspection_or_publication(self):
+        self.seed_post()
+        self.store.begin_operation(
+            "delete-check", "delete", {"tid": "post-1", "post": self.store.get_post("post-1")}
+        )
+        self.store.mark_operation_uncertain("delete-check", "response missing")
+        response = await self.service.check_pending(self.event)
+        self.assertEqual(response.status, "uncertain")
+        self.assertEqual(response.facts["action"], "delete")
+        self.assertIn("尚未确认", response.facts["result"])
+        self.transport.list_posts.assert_not_awaited()
 
 
 if __name__ == "__main__":
