@@ -12,7 +12,7 @@ def build_background_event(context, binding):
     platform_id, message_type, session_id = binding["umo"].split(":", 2)
     platform = context.get_platform_inst(platform_id)
     if platform is None or platform.meta().name != "aiocqhttp":
-        raise RuntimeError("绑定的 QQ 连接尚未就绪，请检查连接或重新执行 /空间绑定")
+        raise RuntimeError("绑定的QQ连接尚未就绪，等待恢复连接或由管理员重新绑定")
     client = platform.get_client()
     message = AstrBotMessage()
     message.type = MessageType(message_type)

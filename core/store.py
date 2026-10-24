@@ -40,13 +40,15 @@ class StateStore:
         self._db.execute("PRAGMA busy_timeout = 30000")
         self._db.execute("PRAGMA journal_mode = WAL")
         self._db.execute("PRAGMA synchronous = FULL")
+        previous_version = self._db.execute("PRAGMA user_version").fetchone()[0]
         with self._db:
             self._db.executescript("""
                 CREATE TABLE IF NOT EXISTS operations (
                     key TEXT PRIMARY KEY, kind TEXT NOT NULL,
                     status TEXT NOT NULL, payload_json TEXT NOT NULL,
                     result_json TEXT, error TEXT, attempts INTEGER NOT NULL DEFAULT 1,
-                    created_at REAL NOT NULL, updated_at REAL NOT NULL
+                    created_at REAL NOT NULL, updated_at REAL NOT NULL,
+                    last_attempt_at REAL NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS posts (
                     tid TEXT PRIMARY KEY, source TEXT NOT NULL,
@@ -81,8 +83,16 @@ class StateStore:
                 CREATE TABLE IF NOT EXISTS kv (
                     key TEXT PRIMARY KEY, value_json TEXT NOT NULL
                 );
-                PRAGMA user_version = 1;
             """)
+            columns = {row[1] for row in self._db.execute("PRAGMA table_info(operations)")}
+            if "last_attempt_at" not in columns:
+                self._db.execute("ALTER TABLE operations ADD COLUMN last_attempt_at REAL NOT NULL DEFAULT 0")
+            self._db.execute(
+                "UPDATE operations SET last_attempt_at=CASE WHEN attempts>1 THEN updated_at "
+                "ELSE created_at END WHERE last_attempt_at=0 OR ?",
+                (previous_version < 2,),
+            )
+            self._db.execute("PRAGMA user_version = 2")
 
     def close(self) -> None:
         """Close the connection after the plugin's background workers stop."""
@@ -138,8 +148,9 @@ class StateStore:
         with self._lock, self._db:
             self._db.execute(
                 "INSERT OR IGNORE INTO operations "
-                "(key,kind,status,payload_json,created_at,updated_at) VALUES (?,?,'inflight',?,?,?)",
-                (key, kind, payload_json, now, now),
+                "(key,kind,status,payload_json,created_at,updated_at,last_attempt_at) "
+                "VALUES (?,?,'inflight',?,?,?,?)",
+                (key, kind, payload_json, now, now, now),
             )
             acquired = bool(self._db.execute("SELECT changes()").fetchone()[0])
             row = self._db.execute("SELECT * FROM operations WHERE key = ?", (key,)).fetchone()
@@ -148,8 +159,8 @@ class StateStore:
             if row["status"] == "failed":
                 self._db.execute(
                     "UPDATE operations SET status='inflight',error=NULL,attempts=attempts+1,"
-                    "updated_at=? WHERE key=?",
-                    (now, key),
+                    "updated_at=?,last_attempt_at=? WHERE key=?",
+                    (now, now, key),
                 )
                 acquired = True
                 row = self._db.execute("SELECT * FROM operations WHERE key=?", (key,)).fetchone()
@@ -186,6 +197,7 @@ class StateStore:
                 "UPDATE operations SET status=?,error=?,updated_at=? WHERE key=?",
                 (status, str(error), time.time(), key),
             )
+            self._sync_auto_plan(key, status, None, time.time())
 
     def mark_operation_uncertain(self, key: str, error: str) -> None:
         """Block automatic retry after an external action may have succeeded."""
@@ -200,6 +212,39 @@ class StateStore:
             "UPDATE operations SET status='done',result_json=?,error=NULL,updated_at=? WHERE key=?",
             (_json(result), now, key),
         )
+
+    def _write_plan(self, plan: dict, now: float) -> None:
+        """Write within the caller's existing transaction, without committing it."""
+        self._db.execute(
+            "UPDATE plans SET status=?,record_json=?,updated_at=? WHERE plan_id=?",
+            (plan["status"], _json(plan), now, plan["plan_id"]),
+        )
+
+    def _sync_auto_plan(self, key: str, status: str, result: dict | None, now: float) -> None:
+        """Keep the opportunity and its external action in one transaction."""
+        if not key.startswith("auto:"):
+            return
+        row = self._db.execute(
+            "SELECT record_json FROM plans WHERE plan_id=?", (key[5:],)
+        ).fetchone()
+        if row is None:
+            return
+        plan = json.loads(row[0])
+        if plan["status"] == "done":
+            return
+        retryable_failure = plan["status"] == "running" and plan.get("retry_version") == 1
+        plan.update(status=status, next_attempt_at=None)
+        if status == "done":
+            plan.update(post_tid=str((result or {}).get("tid") or ""), stage="done")
+        elif status == "uncertain":
+            plan.update(stage="uncertain", last_error_kind="publish_unknown")
+        elif status == "failed":
+            plan.update(
+                stage="failed",
+                last_error_kind="publish_failed",
+                retryable_publish_failure=retryable_failure,
+            )
+        self._write_plan(plan, now)
 
     def _save_post(self, post: dict, now: float) -> None:
         self._db.execute(
@@ -288,6 +333,7 @@ class StateStore:
         with self._lock, self._db:
             operation = self._claimed(op_key, "publish")
             if operation["status"] == "done":
+                self._sync_auto_plan(op_key, "done", operation["result"], now)
                 return _copy(operation["result"])
             existing_row = self._db.execute(
                 "SELECT record_json FROM posts WHERE tid=?", (post["tid"],)
@@ -324,6 +370,7 @@ class StateStore:
                     now,
                 )
             self._done(op_key, post, now)
+            self._sync_auto_plan(op_key, "done", post, now)
             return _copy(post)
 
     def complete_delete(self, op_key: str, tid: str, deleted_at: float) -> dict:
@@ -645,7 +692,17 @@ class StateStore:
                 )
             ]
 
-    def claim_plan(self, plan_id: str) -> bool:
+    def get_plan(self, plan_id: str) -> dict | None:
+        """Read a persisted opportunity including its retry/cache state."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT record_json FROM plans WHERE plan_id=?", (plan_id,)
+            ).fetchone()
+            return json.loads(row[0]) if row else None
+
+    def claim_plan(
+        self, plan_id: str, *, now: float | None = None, retry_delays: list[int] | None = None
+    ) -> bool:
         """Claim an unexecuted plan once; worker recovery does not reclaim uncertainty."""
         with self._lock, self._db:
             row = self._db.execute(
@@ -654,13 +711,88 @@ class StateStore:
             if row is None or row["status"] != "pending":
                 return False
             plan = json.loads(row["record_json"])
+            if now is not None and float(plan.get("next_attempt_at") or plan["slot_at"]) > now:
+                return False
             plan["status"] = "running"
+            if retry_delays is not None:
+                if now is None:
+                    raise ValueError("A retry-aware claim needs its local timestamp")
+                plan.setdefault("first_attempt_at", now)
+                plan.update(
+                    retry_version=1,
+                    attempt_count=int(plan.get("attempt_count", 0)) + 1,
+                    retry_delays=list(retry_delays),
+                    next_attempt_at=None,
+                    stage="claimed",
+                )
             cursor = self._db.execute(
                 "UPDATE plans SET status='running',record_json=?,updated_at=? "
                 "WHERE plan_id=? AND status='pending'",
                 (_json(plan), time.time(), plan_id),
             )
             return cursor.rowcount == 1
+
+    def update_plan(self, plan_id: str, **fields) -> dict:
+        """Persist safe stage/cache fields; never replace the immutable opportunity."""
+        allowed = {
+            "cached_image_path",
+            "cached_summary",
+            "cached_caption",
+            "stage",
+            "last_error_kind",
+        }
+        if fields.keys() - allowed:
+            raise ValueError("Unsupported opportunity update")
+        with self._lock, self._db:
+            plan = self.get_plan(plan_id)
+            if plan is None:
+                raise KeyError(plan_id)
+            if plan["status"] == "done":
+                return plan
+            plan.update(fields)
+            self._write_plan(plan, time.time())
+            return _copy(plan)
+
+    @staticmethod
+    def _plan_retry_state(plan: dict, error_kind: str, now: float) -> None:
+        """Choose the next absolute deadline without expanding the retry budget."""
+        attempts = int(plan.get("attempt_count", 0))
+        delays = plan.get("retry_delays", [])
+        expires = float(plan.get("expires_at", float(plan["slot_at"]) + 3600))
+        plan.setdefault("first_failure_at", now)
+        next_at = (
+            float(plan["first_failure_at"]) + float(delays[attempts - 1])
+            if 0 < attempts <= len(delays)
+            else None
+        )
+        plan.update(last_error_kind=error_kind, next_attempt_at=None)
+        if next_at is None or max(next_at, now) >= expires:
+            plan.update(status="skipped", stage="skipped")
+            if next_at is not None:
+                plan["last_error_kind"] = "retry_window_expired"
+        else:
+            plan.update(status="pending", stage="retry_wait", next_attempt_at=next_at)
+
+    def schedule_plan_retry(self, plan_id: str, error_kind: str, *, now: float) -> dict:
+        """Requeue only a known unsuccessful attempt, preserving its cached media."""
+        with self._lock, self._db:
+            plan = self.get_plan(plan_id)
+            if plan is None:
+                raise KeyError(plan_id)
+            operation = self.get_operation("auto:" + plan_id)
+            if operation and operation["status"] in ("inflight", "uncertain", "done"):
+                self._sync_auto_plan(
+                    operation["key"],
+                    "uncertain" if operation["status"] == "inflight" else operation["status"],
+                    operation.get("result"),
+                    time.time(),
+                )
+                return self.get_plan(plan_id)
+            if plan["status"] not in ("running", "failed"):
+                return plan
+            self._plan_retry_state(plan, error_kind, now)
+            self._write_plan(plan, time.time())
+            return _copy(plan)
 
     def finish_plan(self, plan_id: str, status: str, post_tid: str | None = None) -> dict:
         """Save a terminal result; cannot silently reset a plan to pending/running."""
@@ -676,6 +808,7 @@ class StateStore:
             if plan["status"] == "done":
                 return plan
             plan.update(status=status, post_tid=str(post_tid) if post_tid is not None else None)
+            plan["next_attempt_at"] = None
             self._db.execute(
                 "UPDATE plans SET status=?,record_json=?,updated_at=? WHERE plan_id=?",
                 (status, _json(plan), time.time(), plan_id),
@@ -690,12 +823,34 @@ class StateStore:
             ).fetchall()
             for row in rows:
                 plan = json.loads(row["record_json"])
-                plan["status"] = "cancelled"
+                plan.update(
+                    status="cancelled",
+                    stage="cancelled",
+                    next_attempt_at=None,
+                    last_error_kind="schedule_changed",
+                )
                 self._db.execute(
                     "UPDATE plans SET status='cancelled',record_json=?,updated_at=? "
                     "WHERE plan_id=?",
                     (_json(plan), time.time(), row["plan_id"]),
                 )
+            return len(rows)
+
+    def expire_previous_plans(self, day: str) -> int:
+        """Give yesterday's abandoned opportunities a terminal, inspectable state."""
+        with self._lock, self._db:
+            rows = self._db.execute(
+                "SELECT record_json FROM plans WHERE day<? AND status='pending'", (day,)
+            ).fetchall()
+            for row in rows:
+                plan = json.loads(row[0])
+                plan.update(
+                    status="cancelled",
+                    stage="cancelled",
+                    next_attempt_at=None,
+                    last_error_kind="day_changed",
+                )
+                self._write_plan(plan, time.time())
             return len(rows)
 
     def get_value(self, key: str, default: Any = None) -> Any:
@@ -737,18 +892,34 @@ class StateStore:
                     "WHERE kind=? AND status='running'",
                     (state, now, now, kind),
                 ).rowcount
-            rows = self._db.execute(
-                "SELECT plan_id,record_json FROM plans WHERE status='running'"
-            ).fetchall()
+            rows = self._db.execute("SELECT plan_id,record_json FROM plans").fetchall()
             for row in rows:
                 plan = json.loads(row["record_json"])
-                plan["status"] = "uncertain"
-                self._db.execute(
-                    "UPDATE plans SET status='uncertain',record_json=?,updated_at=? "
-                    "WHERE plan_id=?",
-                    (_json(plan), now, row["plan_id"]),
-                )
-            counts["plans"] = len(rows)
+                operation = self.get_operation("auto:" + row["plan_id"])
+                old_state = _json(plan)
+                if operation and operation["status"] == "done":
+                    self._sync_auto_plan(operation["key"], "done", operation["result"], now)
+                elif operation and operation["status"] in ("inflight", "uncertain"):
+                    self._sync_auto_plan(operation["key"], "uncertain", None, now)
+                elif operation and operation["status"] == "failed":
+                    # An explicit retry already scheduled by the runner survives
+                    # restart. Resolved old uncertainty remains a failed fact.
+                    if plan["status"] == "failed" and plan.get("retryable_publish_failure"):
+                        self._plan_retry_state(plan, "publish_rejected", now)
+                        self._write_plan(plan, now)
+                    elif plan["status"] in ("running", "uncertain") or (
+                        plan["status"] == "pending" and not plan.get("next_attempt_at")
+                    ):
+                        self._sync_auto_plan(operation["key"], "failed", None, now)
+                elif plan["status"] == "running":
+                    if plan.get("retry_version") == 1 and plan.get("first_attempt_at"):
+                        self._plan_retry_state(plan, "interrupted_before_publish", now)
+                    else:
+                        # Legacy running rows lack evidence of their write stage.
+                        plan.update(status="uncertain", next_attempt_at=None)
+                    self._write_plan(plan, now)
+                if _json(self.get_plan(row["plan_id"])) != old_state:
+                    counts["plans"] += 1
             rows = self._db.execute(
                 "SELECT record_json FROM comments WHERE status='processing'"
             ).fetchall()

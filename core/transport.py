@@ -32,6 +32,10 @@ class QzoneReadError(RuntimeError):
     """The remote read did not establish a trustworthy result."""
 
 
+class _CredentialsUnavailable(RuntimeError):
+    """Credential acquisition failed before an HTTP request could be sent."""
+
+
 class QzoneTransport:
     BASE = "https://user.qzone.qq.com"
     UPLOAD_URL = "https://up.qzone.qq.com/cgi-bin/upload/cgi_upload_image"
@@ -107,6 +111,20 @@ class QzoneTransport:
                 nickname = str(info.get("nickname") or nickname)
         return {"uin": context.uin, "nickname": nickname}
 
+    async def _request_context(self) -> Credentials:
+        try:
+            return await self._get_context()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise _CredentialsUnavailable() from None
+
+    def _credential_rejection(self, tid: str = "") -> dict[str, Any]:
+        return self._result(
+            "rejected", tid=tid,
+            message="暂时无法取得空间登录状态，本次操作尚未发送", stage="credentials",
+        )
+
     async def _http_session(self) -> Any:
         if self._http is None or self._http.closed:
             import aiohttp
@@ -123,7 +141,7 @@ class QzoneTransport:
     ) -> dict[str, Any]:
         import aiohttp
 
-        context = await self._get_context()
+        context = await self._request_context()
         client = await self._http_session()
         async with client.request(
             method,
@@ -168,6 +186,12 @@ class QzoneTransport:
             return self._result(
                 "unknown", tid=tid, message=message or "空间操作结果不明，需要核对", code=code
             )
+        nested = raw.get("data")
+        nested_ret = result_code({"ret": nested.get("ret")}) if isinstance(nested, dict) else None
+        if code == 0 and (http >= 400 or nested_ret not in (None, 0)):
+            return self._result(
+                "unknown", tid=tid, message="空间响应相互矛盾，需要核对后再操作", code=code
+            )
         if http >= 400 or code != 0:
             return self._result(
                 "rejected", tid=tid, message=message or f"空间拒绝操作（{code}）", code=code
@@ -177,10 +201,26 @@ class QzoneTransport:
     async def _mutate(
         self, url: str, *, params=None, data=None, tid: str = "", timeout=None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
+        import aiohttp
+
         try:
             raw = await self._request("POST", url, params=params, data=data, timeout=timeout)
         except asyncio.CancelledError:
             raise
+        except _CredentialsUnavailable:
+            return self._credential_rejection(tid), {}
+        except aiohttp.ClientConnectorError:
+            # No HTTP connection was established, so this write was not sent.
+            # Drop the stale connector; only the durable caller may retry later.
+            try:
+                await self.close()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self._http = None
+            return self._result(
+                "rejected", tid=tid, message="空间连接未建立，本次操作尚未发送", stage="connect"
+            ), {}
         except Exception:
             # Exception messages can contain signed URLs/cookies. Do not expose
             # them; the orchestrator already records which operation was active.
@@ -238,8 +278,11 @@ class QzoneTransport:
             raise ValueError("图片为空或超过允许大小")
         return payload
 
-    async def publish(self, text: str, images: Any) -> dict[str, Any]:
-        context = await self._get_context()
+    async def publish(self, text: str, images: Any, *, before_publish=None) -> dict[str, Any]:
+        try:
+            context = await self._request_context()
+        except _CredentialsUnavailable:
+            return self._credential_rejection()
         if isinstance(images, (str, bytes, os.PathLike)):
             images = [images]
         images = list(images or [])
@@ -298,6 +341,15 @@ class QzoneTransport:
         }
         if payloads:
             data.update(pic_bo=",".join(pic_bos), richtype="1", richval="\t".join(richvals))
+        if before_publish is not None:
+            try:
+                await before_publish()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return self._result(
+                    "rejected", message="发布条件已变化，本次说说尚未发送", stage="preflight"
+                )
         result, raw = await self._mutate(
             self.PUBLISH_URL, params={"g_tk": context.gtk, "uin": context.uin}, data=data
         )
@@ -372,7 +424,10 @@ class QzoneTransport:
 
     async def like(self, tid: str) -> dict[str, Any]:
         tid = self._tid(tid)
-        context = await self._get_context()
+        try:
+            context = await self._request_context()
+        except _CredentialsUnavailable:
+            return self._credential_rejection(tid)
         mood = f"http://user.qzone.qq.com/{context.uin}/mood/{tid}"
         result, _ = await self._mutate(
             self.LIKE_URL,
@@ -397,7 +452,10 @@ class QzoneTransport:
 
     async def delete(self, tid: str) -> dict[str, Any]:
         tid = self._tid(tid)
-        context = await self._get_context()
+        try:
+            context = await self._request_context()
+        except _CredentialsUnavailable:
+            return self._credential_rejection(tid)
         result, _ = await self._mutate(
             self.DELETE_URL,
             params={"g_tk": context.gtk},
@@ -423,7 +481,10 @@ class QzoneTransport:
 
     async def reply(self, tid: str, comment: dict[str, Any], text: str) -> dict[str, Any]:
         tid = self._tid(tid)
-        context = await self._get_context()
+        try:
+            context = await self._request_context()
+        except _CredentialsUnavailable:
+            return self._credential_rejection(tid)
         target_uin = number(comment.get("uin"))
         if target_uin <= 0 or target_uin == context.uin:
             return self._result("rejected", tid=tid, message="回复对象无效或为机器人自身")

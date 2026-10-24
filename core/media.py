@@ -7,7 +7,8 @@ import io
 from pathlib import Path
 
 import aiohttp
-from PIL import Image as PILImage
+from PIL import Image as PILImage, ImageOps
+from .dialogue import RequestProblem
 
 MAX_BYTES = 20 * 1024 * 1024
 
@@ -44,9 +45,14 @@ async def collect_images(event, cache_dir: Path, limit=9) -> list[str]:
     if not selected:
         selected = [seg for seg in chain if component_type(seg) == "image"]
     if not selected:
-        raise ValueError("请引用一条包含照片的消息，或在这条消息中附上照片。")
+        raise RequestProblem(
+            "photo_required",
+            {"result": "本条消息及引用内容中都没有照片", "next": "需要用户提供或引用要发布的照片"},
+        )
     if len(selected) > limit:
-        raise ValueError(f"一次最多发布 {limit} 张图片，请缩小选择范围。")
+        raise RequestProblem(
+            "too_many_photos", {"result": "照片数量超过单条说说限制", "max_images": limit}
+        )
     cache_dir.mkdir(parents=True, exist_ok=True)
     result = []
     for segment in selected:
@@ -58,7 +64,9 @@ async def collect_images(event, cache_dir: Path, limit=9) -> list[str]:
             if not reference and hasattr(segment, "convert_to_file_path"):
                 reference = await segment.convert_to_file_path()
         if not reference:
-            raise ValueError("引用图片没有可读取的地址，请重新发送照片。")
+            raise RequestProblem(
+                "photo_unavailable", {"result": "引用的照片当前无法读取，需要用户重新提供"}
+            )
         image = await read_image(str(reference))
         digest = hashlib.sha256(image).hexdigest()
         target = cache_dir / f"{digest}.png"
@@ -118,7 +126,11 @@ async def read_image(reference: str) -> bytes:
                 raise ValueError("图片像素过大")
             image.load()
             output = io.BytesIO()
-            image.convert("RGB").save(output, format="PNG")
+            # Phone photos often store their displayed rotation only in EXIF.
+            # Bake it into the pixels before conversion discards that metadata.
+            with ImageOps.exif_transpose(image) as oriented:
+                with oriented.convert("RGB") as normalized:
+                    normalized.save(output, format="PNG")
             if output.tell() > MAX_BYTES:
                 raise ValueError("图片转换后超过 20 MB")
             return output.getvalue()
