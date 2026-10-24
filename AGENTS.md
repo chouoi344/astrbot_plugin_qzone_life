@@ -1,5 +1,6 @@
 # QQ空间开发约定
 
+- 市场发布检查：日志统一`from astrbot.api import logger`，禁止内置或第三方日志库；运行数据使用`StarTools.get_data_dir`，固定提示词保留原前缀。`tests/test_market_rules.py`随现有CI检查日志导入来源；修改日志时同时验证无AstrBot的测试环境及真实宿主导入。
 - 插件显示名称为 `QQ空间`，ID 为 `astrbot_plugin_qzone_life`；聊天与QQ空间始终使用同一人格，选择入口沿用AstrBot聊天设置，不加独立人格字段。
 - 优先复用现有插件：Life Scheduler 提供日程，Gitee AI Image 生成自拍，LivingMemory 保存记忆。不修改它们的源码或私自扩大记忆共享范围。
 - QQ空间协议来自用户提供的 `Zhalslar/astrbot_plugin_qzone` v3.1.3；维护来源说明及 GPL-3.0 许可证。
