@@ -41,6 +41,28 @@ def parse_response(text: str) -> dict[str, Any]:
     """Read JSON/JSONP without evaluating JavaScript or logging response secrets."""
     if not text or not text.strip():
         return {"code": -1, "message": "空间返回空响应", "_parse_error": True}
+    # Delete CGI returns an iframe document whose try/catch braces precede the
+    # JSON object. Decode only its single terminal callback, never the script.
+    callbacks = list(re.finditer(r"\bframeElement\.callback\s*\(\s*", text))
+    if callbacks and re.match(r"\s*<html\b", text, re.IGNORECASE):
+        if len(callbacks) == 1:
+            value = text[callbacks[0].end() :]
+            try:
+                parsed, end = json.JSONDecoder().raw_decode(value)
+            except (ValueError, TypeError):
+                pass
+            else:
+                if (
+                    isinstance(parsed, dict)
+                    and "code" in parsed
+                    and re.fullmatch(
+                        r"\s*\)\s*;\s*</script>\s*</body>\s*</html>\s*",
+                        value[end:],
+                        re.IGNORECASE,
+                    )
+                ):
+                    return parsed
+        return {"code": -1, "message": "空间响应无法解析", "_parse_error": True}
     begin, end = text.find("{"), text.rfind("}")
     if begin < 0 or end < begin:
         return {"code": -1, "message": "空间响应格式无法识别", "_parse_error": True}

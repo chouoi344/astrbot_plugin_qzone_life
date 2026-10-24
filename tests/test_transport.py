@@ -264,9 +264,48 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ParserTests(unittest.TestCase):
+    IFRAME_DELETE = (
+        '<html><head><meta http-equiv="Content-Type" '
+        'content="text/html; charset=UTF-8" /></head><body>'
+        '<script type="text/javascript"> var cb;'
+        'try{document.domain="example.invalid";cb=frameElement.callback;}'
+        'catch(e){try{document.domain="example.invalid";cb=frameElement.callback;}'
+        'catch(e){document.domain="example.invalid";cb=frameElement.callback;}} '
+        'frameElement.callback({"code":0,"data":{"feeds":""},"message":"",'
+        '"needVerify":0,"subcode":0}); </script></body></html>'
+    )
+
+    def test_real_delete_iframe_response(self):
+        result = parse_response(self.IFRAME_DELETE)
+        self.assertEqual(
+            result, {"code": 0, "data": {"feeds": ""}, "message": "", "needVerify": 0, "subcode": 0}
+        )
+
+    def test_iframe_rejection_is_not_success(self):
+        result = parse_response(self.IFRAME_DELETE.replace('"code":0', '"code":-403'))
+        transport = QzoneTransport(FakeQQ(), "10001")
+        self.assertEqual(transport._classify(result)["status"], "rejected")
+
+    def test_incomplete_or_ambiguous_iframe_is_unknown(self):
+        for response in (
+            self.IFRAME_DELETE.replace('"code":0,', ""),
+            self.IFRAME_DELETE.replace("); </script>", "); alert(1); </script>"),
+            self.IFRAME_DELETE.replace(
+                "); </script>", '); frameElement.callback({"code":0}); </script>'
+            ),
+            self.IFRAME_DELETE.replace("</html>", ""),
+            self.IFRAME_DELETE.replace('"code":0', '"code":undefined'),
+        ):
+            with self.subTest(response=response):
+                self.assertTrue(parse_response(response)["_parse_error"])
+
     def test_jsonp_and_chinese_content(self):
         self.assertEqual(
             parse_response('_preloadCallback({"code":0,"content":"日常"});')["content"], "日常"
+        )
+        self.assertEqual(
+            parse_response('{"code":0,"content":"frameElement.callback( belongs to text"}')["code"],
+            0,
         )
 
     def test_bad_response_is_explicitly_unknown(self):

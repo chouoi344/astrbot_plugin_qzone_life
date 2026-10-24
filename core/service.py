@@ -721,7 +721,7 @@ class QzoneService:
         binding = self.store.get_value("binding")
         summary = self.store.summary()
         lines = [
-            "QQ空间 v0.1.0",
+            "QQ空间 v0.1.1",
             f"绑定：{binding['bot_id'] + ' / ' + str(binding.get('persona_id')) if binding else '未绑定，请在管理员私聊执行 /空间绑定'}",
             f"后台：{'已暂停' if self.store.get_value('paused', False) else '运行中（需完成绑定）'}",
             f"今日自主已发：{self.store.count_autonomous(str(self.now().date()))}，每日目标 1—2 条；用户要求不计额度",
