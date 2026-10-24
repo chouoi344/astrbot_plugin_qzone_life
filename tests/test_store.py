@@ -55,6 +55,167 @@ class StateStoreTests(unittest.TestCase):
             "binding": self.binding,
         }
 
+    def plan(self, plan_id="retry", **extra):
+        return self.store.save_plan(
+            {
+                "plan_id": plan_id,
+                "day": "2026-10-24",
+                "schedule_hash": "hash",
+                "slot_at": time.time() - 30,
+                "expires_at": time.time() + 3600,
+                "activity": "咖啡店休息",
+                **extra,
+            }
+        )
+
+    def test_retry_deadlines_are_absolute_and_claims_are_due_and_atomic(self):
+        first = time.time()
+        self.plan()
+        self.assertTrue(self.store.claim_plan("retry", now=first, retry_delays=[600, 1800]))
+        self.assertFalse(self.store.claim_plan("retry", now=first, retry_delays=[600, 1800]))
+        self.store.update_plan("retry", cached_image_path="/cached.png", stage="vision")
+        plan = self.store.schedule_plan_retry("retry", "vision_failed", now=first + 10)
+        self.assertEqual((plan["status"], plan["next_attempt_at"]), ("pending", first + 610))
+        self.assertEqual(plan["first_failure_at"], first + 10)
+        self.assertFalse(self.store.claim_plan("retry", now=first + 609, retry_delays=[600, 1800]))
+        self.assertTrue(self.store.claim_plan("retry", now=first + 610, retry_delays=[600, 1800]))
+        plan = self.store.schedule_plan_retry("retry", "vision_failed", now=first + 620)
+        self.assertEqual(plan["next_attempt_at"], first + 1810)
+        self.assertEqual(plan["cached_image_path"], "/cached.png")
+        self.assertTrue(self.store.claim_plan("retry", now=first + 1810, retry_delays=[600, 1800]))
+        plan = self.store.schedule_plan_retry("retry", "vision_failed", now=first + 1820)
+        self.assertEqual((plan["status"], plan["attempt_count"]), ("skipped", 3))
+        self.assertIsNone(plan["next_attempt_at"])
+
+    def test_stage_updates_are_explicit_and_reject_unsafe_metadata(self):
+        self.plan()
+        self.store.update_plan("retry", stage="caption", cached_summary="蓝色外套")
+        self.assertEqual(self.store.get_plan("retry")["cached_summary"], "蓝色外套")
+        with self.assertRaises(ValueError):
+            self.store.update_plan("retry", provider_metadata={"token": "secret"})
+        self.store.save_plan({**self.plan(), "stage": "replaced"})
+        self.assertEqual(self.store.get_plan("retry")["stage"], "caption")
+
+    def test_generation_restart_recovers_cache_and_consumed_attempt(self):
+        first = time.time()
+        self.plan()
+        self.store.claim_plan("retry", now=first, retry_delays=[600, 1800])
+        self.store.update_plan("retry", stage="caption", cached_image_path="/cached.png")
+        self.store.close()
+        self.store = StateStore(self.path)
+        self.assertEqual(self.store.recover_interrupted()["plans"], 1)
+        plan = self.store.get_plan("retry")
+        self.assertEqual((plan["status"], plan["attempt_count"]), ("pending", 1))
+        self.assertGreaterEqual(plan["first_failure_at"], first)
+        self.assertEqual(plan["next_attempt_at"], plan["first_failure_at"] + 600)
+        self.assertEqual(plan["cached_image_path"], "/cached.png")
+
+    def test_interrupted_network_write_is_unknown_and_never_requeued(self):
+        first = time.time()
+        self.plan()
+        self.store.claim_plan("retry", now=first, retry_delays=[600, 1800])
+        self.store.update_plan("retry", stage="publish")
+        self.store.begin_operation("auto:retry", "publish", {"post": self.post()})
+        self.store.recover_interrupted()
+        self.assertEqual(self.store.get_plan("retry")["status"], "uncertain")
+        plan = self.store.schedule_plan_retry("retry", "forced", now=first + 600)
+        self.assertEqual(plan["status"], "uncertain")
+        self.assertFalse(self.store.claim_plan("retry", now=first + 600, retry_delays=[600, 1800]))
+
+    def test_reconciliation_updates_plan_for_success_and_failure(self):
+        self.plan("success")
+        self.store.begin_operation("auto:success", "publish", {"post": self.post()})
+        self.store.mark_operation_uncertain("auto:success", "unknown")
+        self.assertEqual(self.store.get_plan("success")["status"], "uncertain")
+        self.store.complete_publish("auto:success", self.post())
+        self.assertEqual(self.store.get_plan("success")["status"], "done")
+        self.assertEqual(self.store.get_plan("success")["post_tid"], "tid-1")
+        self.plan("failure")
+        self.store.begin_operation("auto:failure", "publish", {"post": self.post("tid-2")})
+        self.store.mark_operation_uncertain("auto:failure", "unknown")
+        self.store.mark_operation_failed("auto:failure", "管理员核对未发生")
+        self.assertEqual(self.store.get_plan("failure")["status"], "failed")
+        self.assertEqual(self.store.count_autonomous("2026-10-24"), 1)
+
+    def test_recovery_aligns_old_resolved_records_and_preserves_pending_explicit_retry(self):
+        self.store.begin_operation("auto:done", "publish", {"post": self.post()})
+        self.store.complete_publish("auto:done", self.post())
+        self.plan("done", status="uncertain")
+        self.store.begin_operation("auto:failed", "publish", {"post": self.post("other")})
+        self.store.mark_operation_failed("auto:failed", "known failure")
+        self.plan("failed", status="uncertain")
+        first = time.time()
+        self.plan("retry")
+        self.store.claim_plan("retry", now=first, retry_delays=[600, 1800])
+        self.store.begin_operation("auto:retry", "publish", {"post": self.post("retry")})
+        self.store.mark_operation_failed("auto:retry", "rejected")
+        self.store.schedule_plan_retry("retry", "publish_rejected", now=first)
+        self.store.recover_interrupted()
+        self.assertEqual(self.store.get_plan("done")["status"], "done")
+        self.assertEqual(self.store.get_plan("failed")["status"], "failed")
+        self.assertEqual(self.store.get_plan("retry")["status"], "pending")
+        self.assertEqual(self.store.get_plan("retry")["next_attempt_at"], first + 600)
+
+    def test_plan_completion_is_in_publish_transaction(self):
+        self.plan()
+        self.store.claim_plan("retry")
+        self.store.begin_operation("auto:retry", "publish", {"post": self.post()})
+        original = self.store._sync_auto_plan
+
+        def fail_after_plan_write(*args):
+            original(*args)
+            raise RuntimeError("crash before commit")
+
+        with patch.object(self.store, "_sync_auto_plan", fail_after_plan_write):
+            with self.assertRaises(RuntimeError):
+                self.store.complete_publish("auto:retry", self.post())
+        self.assertEqual(self.store.get_operation("auto:retry")["status"], "inflight")
+        self.assertEqual(self.store.get_plan("retry")["status"], "running")
+        self.assertEqual(self.store.list_posts(), [])
+        self.assertEqual(self.store.due_outbox(), [])
+
+    def test_restart_between_known_rejection_and_retry_schedule_preserves_remaining_budget(self):
+        first = time.time()
+        self.plan()
+        self.store.claim_plan("retry", now=first, retry_delays=[600, 1800])
+        self.store.update_plan("retry", stage="publish", cached_image_path="/cached.png")
+        self.store.begin_operation("auto:retry", "publish", {"post": self.post()})
+        self.store.mark_operation_failed("auto:retry", "definite rejection")
+        self.assertTrue(self.store.get_plan("retry")["retryable_publish_failure"])
+        self.store.recover_interrupted()
+        plan = self.store.get_plan("retry")
+        self.assertEqual(plan["status"], "pending")
+        self.assertEqual(plan["attempt_count"], 1)
+        self.assertEqual(plan["next_attempt_at"], plan["first_failure_at"] + 600)
+        self.assertEqual(plan["cached_image_path"], "/cached.png")
+
+    def test_admin_reconciled_failure_is_terminal_on_restart(self):
+        first = time.time()
+        self.plan()
+        self.store.claim_plan("retry", now=first, retry_delays=[600, 1800])
+        self.store.begin_operation("auto:retry", "publish", {"post": self.post()})
+        self.store.mark_operation_uncertain("auto:retry", "unknown")
+        self.store.mark_operation_failed("auto:retry", "管理员已确认未发生")
+        self.assertFalse(self.store.get_plan("retry")["retryable_publish_failure"])
+        self.store.recover_interrupted()
+        self.assertEqual(self.store.get_plan("retry")["status"], "failed")
+
+    def test_operation_failure_and_plan_failure_rollback_together(self):
+        self.plan()
+        self.store.claim_plan("retry")
+        self.store.begin_operation("auto:retry", "publish", {"post": self.post()})
+        original = self.store._sync_auto_plan
+
+        def fail_after_plan_write(*args):
+            original(*args)
+            raise RuntimeError("crash before commit")
+
+        with patch.object(self.store, "_sync_auto_plan", fail_after_plan_write):
+            with self.assertRaises(RuntimeError):
+                self.store.mark_operation_failed("auto:retry", "rejected")
+        self.assertEqual(self.store.get_operation("auto:retry")["status"], "inflight")
+        self.assertEqual(self.store.get_plan("retry")["status"], "running")
+
     def test_idempotent_publish_queues_each_followup_once(self):
         first = self.store.begin_operation("action", "publish", {"caption": "coffee"})
         second = self.store.begin_operation("action", "publish", {"caption": "coffee"})

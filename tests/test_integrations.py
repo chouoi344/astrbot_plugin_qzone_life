@@ -9,8 +9,10 @@ import sys
 import tempfile
 import types
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
+from zoneinfo import ZoneInfo
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "core" / "integrations.py"
 SPEC = importlib.util.spec_from_file_location("qzone_life_integrations_test", MODULE_PATH)
@@ -308,6 +310,19 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.engine.rows()), 3)
         self.assertEqual(self.engine.replace_calls, 3)
 
+    async def test_deletion_keeps_original_memory_owner_without_inventing_its_actor(self):
+        payload = await self.payload("delete")
+        # A later chat persona can delete an older post from the same QQ account.
+        # The durable memory still belongs to the original post's character.
+        await self.bridge.sync_memory(self.event, payload)
+        row = self.engine.rows()[0]
+        metadata = json.loads(row["metadata"])
+        self.assertEqual(metadata["persona_id"], "角色 A")
+        self.assertEqual(metadata["session_id"], self.scope)
+        self.assertIn("角色 A此前发布", row["text"])
+        self.assertIn("从该QQ账号的空间删除", row["text"])
+        self.assertNotIn("删除了自己的", row["text"])
+
     async def test_late_comment_after_deletion_is_marked_historical(self):
         await self.bridge.sync_memory(self.event, await self.payload("delete"))
         await self.bridge.sync_memory(self.event, await self.payload("comment"))
@@ -349,6 +364,117 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(mod.IntegrationIncompatible):
             await self.bridge.life_context()
         self.assertEqual(calls, [])
+
+    def dated_life_fixture(self, now, business_now):
+        result = {"outfit": "外套", "schedule": "00:00-02:00 看书", "meta": {"style": "日常"}}
+        record = types.SimpleNamespace(
+            date=str(business_now.date()), outfit=result["outfit"], schedule=result["schedule"]
+        )
+        peer_type = type("LifeSchedulerPlugin", (), {"__module__": "test_life.main"})
+        peer = peer_type()
+        peer.config = {"schedule_time": "07:00"}
+        peer.scheduler = types.SimpleNamespace(timezone=ZoneInfo("Asia/Shanghai"))
+        peer.data_mgr = types.SimpleNamespace(get=Mock(return_value=record))
+        peer.get_life_context = AsyncMock(return_value=result)
+        self.peers["astrbot_plugin_life_scheduler"] = types.SimpleNamespace(
+            star_cls=peer, activated=True
+        )
+        utils = types.ModuleType("test_life.core.utils")
+        utils.resolve_business_now = Mock(return_value=business_now)
+        utils.parse_schedule_time = Mock(return_value=(7, 0))
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now.astimezone(tz) if tz is not None else now.replace(tzinfo=None)
+
+        return peer, result, record, utils, Clock
+
+    async def test_life_metadata_preserves_prior_business_day_until_refresh(self):
+        now = datetime(2026, 10, 25, 0, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+        business_now = now - timedelta(days=1)
+        peer, original, record, utils, clock = self.dated_life_fixture(now, business_now)
+        with (
+            patch.dict(sys.modules, {"test_life.core.utils": utils}),
+            patch.object(mod, "datetime", clock),
+        ):
+            result = await self.bridge.life_context()
+        self.assertEqual(result["meta"]["qzone_schedule_day"], "2026-10-24")
+        self.assertEqual(
+            result["meta"]["qzone_valid_until"], now.replace(hour=7, minute=0).timestamp()
+        )
+        self.assertEqual(original["meta"], {"style": "日常"})
+        peer.get_life_context.assert_awaited_once_with(allow_generate=False)
+        peer.data_mgr.get.assert_called_once_with(business_now)
+        utils.resolve_business_now.assert_called_once_with("07:00", now=now)
+
+    async def test_life_metadata_after_refresh_expires_at_next_generation(self):
+        now = datetime(2026, 10, 25, 8, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        peer, original, record, utils, clock = self.dated_life_fixture(now, now)
+        with (
+            patch.dict(sys.modules, {"test_life.core.utils": utils}),
+            patch.object(mod, "datetime", clock),
+        ):
+            result = await self.bridge.life_context()
+        self.assertEqual(result["meta"]["qzone_schedule_day"], "2026-10-25")
+        self.assertEqual(
+            result["meta"]["qzone_valid_until"],
+            (now.replace(hour=7) + timedelta(days=1)).timestamp(),
+        )
+
+    async def test_life_snapshot_reports_existing_generation_without_starting_one(self):
+        now = datetime(2026, 10, 25, 8, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        peer, original, record, utils, clock = self.dated_life_fixture(now, now)
+        peer.generator = types.SimpleNamespace(_generating=True, generate_schedule=AsyncMock())
+        with (
+            patch.dict(sys.modules, {"test_life.core.utils": utils}),
+            patch.object(mod, "datetime", clock),
+        ):
+            result = await self.bridge.life_context()
+        self.assertTrue(result["meta"]["qzone_generation_in_progress"])
+        peer.generator.generate_schedule.assert_not_awaited()
+        self.assertEqual(original["meta"], {"style": "日常"})
+
+    async def test_life_snapshot_keeps_generation_marker_if_it_finishes_during_read(self):
+        now = datetime(2026, 10, 25, 8, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        peer, original, record, utils, clock = self.dated_life_fixture(now, now)
+        peer.generator = types.SimpleNamespace(_generating=True)
+
+        async def finishing_read(*, allow_generate):
+            self.assertFalse(allow_generate)
+            peer.generator._generating = False
+            return original
+
+        peer.get_life_context = finishing_read
+        with (
+            patch.dict(sys.modules, {"test_life.core.utils": utils}),
+            patch.object(mod, "datetime", clock),
+        ):
+            result = await self.bridge.life_context()
+        self.assertTrue(result["meta"]["qzone_generation_in_progress"])
+        self.assertFalse(peer.generator._generating)
+
+    async def test_life_snapshot_changing_during_refresh_is_not_misdated(self):
+        now = datetime(2026, 10, 25, 7, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        peer, original, record, utils, clock = self.dated_life_fixture(now, now)
+        record.schedule = "08:00-09:00 新日程"
+        with (
+            patch.dict(sys.modules, {"test_life.core.utils": utils}),
+            patch.object(mod, "datetime", clock),
+        ):
+            self.assertEqual(await self.bridge.life_context(), {})
+
+    async def test_missing_or_wrong_day_cache_does_not_extend_old_schedule(self):
+        now = datetime(2026, 10, 25, 7, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        peer, original, record, utils, clock = self.dated_life_fixture(now, now)
+        record.date = "2026-10-24"
+        with (
+            patch.dict(sys.modules, {"test_life.core.utils": utils}),
+            patch.object(mod, "datetime", clock),
+        ):
+            self.assertEqual(await self.bridge.life_context(), {})
+            peer.data_mgr.get.return_value = None
+            self.assertEqual(await self.bridge.life_context(), {})
 
     async def test_selfie_returns_file_without_chat_delivery(self):
         with tempfile.TemporaryDirectory() as folder:
