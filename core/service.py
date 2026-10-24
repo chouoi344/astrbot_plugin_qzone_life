@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import logging
 import re
 import time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+from astrbot.api import logger
 
 from .events import build_background_event
 from .dialogue import ClarificationNeeded, Outcome, RequestProblem
@@ -29,8 +30,6 @@ from .providers import resolve_provider_id
 from .settings import Settings, admin_ids
 from .store import StateStore
 from .transport import QzoneTransport
-
-log = logging.getLogger("astrbot")
 
 
 class QzoneService:
@@ -916,7 +915,7 @@ class QzoneService:
                     await self.poll_comments(event, binding)
                 except Exception as exc:
                     self.store.set_value("last_comment_error", str(exc)[:500])
-                    log.warning("QQ空间评论检查未完成：%s", exc)
+                    logger.warning("QQ空间评论检查未完成：%s", exc)
         await self.run_autonomous(event, binding)
         await self.process_outbox()
 
@@ -928,7 +927,7 @@ class QzoneService:
                 raise
             except Exception as exc:
                 self.store.set_value("last_background_error", str(exc)[:500])
-                log.warning("QQ空间后台任务等待恢复：%s", exc)
+                logger.warning("QQ空间后台任务等待恢复：%s", exc)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=30)
             except asyncio.TimeoutError:
@@ -1185,7 +1184,7 @@ class QzoneService:
         binding = self.store.get_value("binding")
         summary = self.store.summary()
         lines = [
-            "QQ空间 v0.2.0",
+            "QQ空间 v0.2.1",
             f"绑定：{binding['bot_id'] + ' / ' + str(binding.get('persona_id')) if binding else '未绑定，等待管理员在与角色的私聊中启用空间'}",
             f"后台：{'已暂停' if self.store.get_value('paused', False) else '运行中（需完成绑定）'}",
             f"今日自主已发：{self.store.count_autonomous(str(self.now().date()))}，每日上限 {self.settings.daily_max} 条；用户要求不计额度",
