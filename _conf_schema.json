@@ -1,137 +1,42 @@
 {
   "auto_publish": {
-    "description": "按角色日程自主发布",
-    "hint": "完成管理员私聊绑定后，读取已有日程并生成自拍分享。没有合适时段时可以少发或不发。修改后重载插件生效。",
+    "description": "自己分享日常",
+    "hint": "跟着角色的日程拍自拍、发空间；没有合适的日常或照片时，可以少发或不发。",
     "type": "bool",
     "default": true
   },
-  "auto_reply": {
-    "description": "自动回复管理员的新评论",
-    "hint": "只回复 AstrBot 管理员 QQ 号在角色自己说说下的新评论；不回复其他用户和机器人自己的评论。",
-    "type": "bool",
-    "default": true
-  },
-  "admin_commands_only": {
-    "description": "仅管理员可发布、查看列表和删除",
-    "hint": "建议保持开启。关闭后其他聊天用户也能请求操作角色空间；自动回评仍只针对管理员。绑定、暂停、恢复和核对仍需管理员。",
-    "type": "bool",
-    "default": true
-  },
-  "daily_min": {
-    "description": "每日自主发布目标最少条数",
-    "hint": "范围 1—2，不能大于最多条数。只是目标，缺少日程或生成失败时不凑数。用户主动要求发布不计入。",
-    "type": "int",
-    "default": 1,
-    "slider": { "min": 1, "max": 2, "step": 1 }
-  },
-  "daily_max": {
-    "description": "每日自主发布目标最多条数",
-    "hint": "范围 1—2。删除已发说说不会返还当天自主额度。",
+  "daily_post_limit": {
+    "description": "每天最多自己发几条",
+    "hint": "0 表示暂停自己发日常，仍可按你的要求发空间、回复留言；你主动让TA发的另算。",
     "type": "int",
     "default": 2,
-    "slider": { "min": 1, "max": 2, "step": 1 }
+    "slider": {
+      "min": 0,
+      "max": 5,
+      "step": 1
+    }
   },
-  "min_gap_minutes": {
-    "description": "自主发布最短间隔（分钟）",
-    "hint": "只限制两次自主发布，不限制用户明确要求的手动发布。",
-    "type": "int",
-    "default": 180,
-    "slider": { "min": 30, "max": 1440, "step": 1 }
-  },
-  "active_start": {
-    "description": "自主发布开始小时",
-    "hint": "使用下方时区，范围 0—23。开始小时必须早于结束小时，暂不支持跨午夜时段。",
-    "type": "int",
-    "default": 8,
-    "slider": { "min": 0, "max": 23, "step": 1 }
-  },
-  "active_end": {
-    "description": "自主发布结束小时",
-    "hint": "范围 1—24；不包含结束小时，例如 23 表示 23:00 起不再安排自主发布。",
-    "type": "int",
-    "default": 23,
-    "slider": { "min": 1, "max": 24, "step": 1 }
-  },
-  "poll_seconds": {
-    "description": "新评论检查间隔（秒）",
-    "hint": "默认每 180 秒检查一次。修改后重载插件生效。",
-    "type": "int",
-    "default": 180,
-    "slider": { "min": 60, "max": 3600, "step": 1 }
-  },
-  "watch_posts": {
-    "description": "监测最近说说数量",
-    "hint": "范围 1—50。只检查最近这些自己的说说；当前不会连续翻取所有历史帖子和评论页。",
-    "type": "int",
-    "default": 20,
-    "slider": { "min": 1, "max": 50, "step": 1 }
-  },
-  "max_replies_per_poll": {
-    "description": "每轮最多自动回复条数",
-    "hint": "只计算符合条件的管理员新评论。其余已记录的待回复评论留待后续检查。",
-    "type": "int",
-    "default": 5,
-    "slider": { "min": 1, "max": 20, "step": 1 }
+  "auto_reply": {
+    "description": "回复我的留言",
+    "hint": "开启后，会回应你在TA空间里的新评论；只回复管理员账号的留言。",
+    "type": "bool",
+    "default": true
   },
   "llm_provider_id": {
-    "description": "配文与回复使用的模型",
-    "hint": "填写或选择 AstrBot 模型提供商 ID；留空使用对应会话当前模型。自拍生图服务商仍由 Gitee AI Image 管理。",
+    "description": "写说说、回评论的 AI",
+    "hint": "留空跟随聊天使用的 AI，也可以单独选择；看照片沿用 AstrBot 的识图设置。",
     "type": "string",
-    "default": "",
-    "_special": "select_provider"
-  },
-  "vision_provider_id": {
-    "description": "照片识别使用的模型",
-    "hint": "必须支持图片输入。留空使用对应会话当前模型，不会自动继承上方单独指定的文本模型。",
-    "type": "string",
-    "default": "",
-    "_special": "select_provider"
-  },
-  "persona_id": {
-    "description": "固定角色人设 ID",
-    "hint": "留空时由 /空间绑定 固定管理员私聊当前人设。填写时须与绑定会话所选人设一致。自主发布还要求与日程插件使用的 AstrBot 全局默认人设一致；修改配置不会迁移已有记忆。",
-    "type": "string",
+    "_special": "select_provider",
     "default": ""
   },
-  "timezone": {
-    "description": "自主日程与每日额度时区",
-    "hint": "默认 Asia/Shanghai，建议与 Life Scheduler 日程时区一致。留空时尝试沿用 AstrBot 时区；修改后重载。",
+  "failure_policy": {
+    "description": "自拍没拍好时",
+    "hint": "自己分享日常时，选择直接略过，或稍后再试；一直没拍好就安静略过，不会改发纯文字。",
     "type": "string",
-    "default": "Asia/Shanghai"
-  },
-  "selfie_timeout": {
-    "description": "自拍生成等待时间（秒）",
-    "hint": "范围 60—1200。超时后本次自主任务不会继续发布未取得的图片。",
-    "type": "int",
-    "default": 300,
-    "slider": { "min": 60, "max": 1200, "step": 1 }
-  },
-  "llm_timeout": {
-    "description": "配文、识图和回评模型等待时间（秒）",
-    "hint": "范围 15—300。按服务商实际响应速度调整。",
-    "type": "int",
-    "default": 90,
-    "slider": { "min": 15, "max": 300, "step": 1 }
-  },
-  "request_timeout": {
-    "description": "QQ空间单次请求等待时间（秒）",
-    "hint": "范围 10—120。发布、删除或回复超时可能已被空间接收；出现结果未确定时请用 /空间待核对 和 /空间核对 处理。",
-    "type": "int",
-    "default": 45,
-    "slider": { "min": 10, "max": 120, "step": 1 }
-  },
-  "cookie_ttl": {
-    "description": "空间登录凭证刷新间隔（秒）",
-    "hint": "范围 60—86400。凭证从现有 QQ 连接读取，无需手动填写或上传 Cookie。",
-    "type": "int",
-    "default": 1800,
-    "slider": { "min": 60, "max": 86400, "step": 1 }
-  },
-  "max_images": {
-    "description": "单条说说最多图片数",
-    "hint": "范围 1—9。优先使用引用消息中的图片；没有引用图片时使用当前消息的图片。",
-    "type": "int",
-    "default": 9,
-    "slider": { "min": 1, "max": 9, "step": 1 }
+    "options": [
+      "直接跳过",
+      "稍后重试"
+    ],
+    "default": "稍后重试"
   }
 }

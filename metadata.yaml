@@ -1,7 +1,7 @@
 name: astrbot_plugin_qzone_life
 display_name: QQ空间
 desc: 固定角色的 QQ 空间：引用照片发布、删除、自赞、管理员评论回评、日程自拍及 LivingMemory 记忆同步。
-version: v0.1.1
+version: v0.2.0
 author: chouoi344
 repo: https://github.com/chouoi344/astrbot_plugin_qzone_life
 astrbot_version: ">=4.26.8,<5"
