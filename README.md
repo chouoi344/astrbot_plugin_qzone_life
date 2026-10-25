@@ -2,7 +2,7 @@
 
 让角色经营自己的 QQ空间：接收你引用的照片、按日程分享自拍、回复你的留言，并把这些经历记进 LivingMemory。
 
-插件标识：`astrbot_plugin_qzone_life` · 当前版本：`v0.2.2` · [GitHub 仓库](https://github.com/chouoi344/astrbot_plugin_qzone_life)
+插件标识：`astrbot_plugin_qzone_life` · 当前版本：`v0.2.3` · [GitHub 仓库](https://github.com/chouoi344/astrbot_plugin_qzone_life)
 
 ## 开始使用
 
