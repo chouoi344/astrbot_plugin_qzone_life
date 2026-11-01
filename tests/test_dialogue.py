@@ -53,7 +53,7 @@ class DialogueTests(unittest.IsolatedAsyncioTestCase):
 
     def plugin(self):
         plugin = self.plugin_class()
-        plugin.service = SimpleNamespace(llm=AsyncMock())
+        plugin.service = SimpleNamespace(llm=AsyncMock(), ensure_ready=AsyncMock())
         return plugin
 
     async def test_tool_returns_facts_without_generating_or_sending_a_reply(self):
@@ -73,6 +73,24 @@ class DialogueTests(unittest.IsolatedAsyncioTestCase):
         event.send.assert_not_awaited()
         event.set_result.assert_not_called()
         event.set_extra.assert_not_called()
+        plugin.service.ensure_ready.assert_awaited_once_with(event, required=True)
+
+    async def test_waiting_setup_does_not_execute_the_requested_write(self):
+        plugin = self.plugin()
+        plugin.service.ensure_ready.side_effect = RequestProblem(
+            "qq_waiting", {"result": "QQ连接恢复后自动继续"}, status="waiting"
+        )
+        operation = Mock()
+        result = json.loads(await plugin._run(object(), operation, action="publish"))
+        self.assertEqual(result["status"], "waiting")
+        operation.assert_not_called()
+
+    async def test_pause_does_not_wait_for_unavailable_setup_dependencies(self):
+        plugin = self.plugin()
+        outcome = Outcome("paused", action="pause", status="done", facts={"result": "已暂停"})
+        result = json.loads(await plugin._run(object(), lambda: outcome, action="control"))
+        self.assertEqual(result["status"], "done")
+        plugin.service.ensure_ready.assert_not_awaited()
 
     async def test_original_persona_prompt_history_and_memory_remain_in_request(self):
         plugin = self.plugin()
@@ -105,7 +123,7 @@ class DialogueTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("fallback", json.dumps(result))
 
     def test_safe_input_reasons_remain_specific(self):
-        for code in ("photo_required", "caption_invalid", "binding_required", "binding_changed"):
+        for code in ("photo_required", "caption_invalid", "space_preparing", "binding_changed"):
             problem = RequestProblem(code, {"result": "受控的执行事实"}, status="needs_setup")
             result = exception_outcome(problem, action="publish")
             self.assertEqual(result.facts["reason"], code)
@@ -134,7 +152,7 @@ class DialogueTests(unittest.IsolatedAsyncioTestCase):
             hasattr(Outcome("ok", action="publish", status="done", facts={}), "fallback")
         )
 
-    def test_all_eight_natural_tools_remain_available(self):
+    def test_natural_tools_need_no_manual_setup_tool(self):
         names = {
             d.keywords[0].value.value
             for node in ast.walk(self.tree)
@@ -151,7 +169,6 @@ class DialogueTests(unittest.IsolatedAsyncioTestCase):
                 "qzone_delete_post",
                 "qzone_list_own_posts",
                 "qzone_space_status",
-                "qzone_prepare_space",
                 "qzone_pause_or_resume",
                 "qzone_retry_last_photo",
                 "qzone_check_pending",

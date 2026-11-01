@@ -52,6 +52,8 @@ class QzoneLifePlugin(Star):
         # Return evidence to the existing conversation's tool loop. The original
         # character model keeps its history, memory and control of the reply.
         try:
+            if action != "control":
+                await self.service.ensure_ready(event, required=action != "status")
             result = operation()
             result = await result if inspect.isawaitable(result) else result
             if not isinstance(result, Outcome):
@@ -97,11 +99,6 @@ class QzoneLifePlugin(Star):
     async def status_tool(self, event: AstrMessageEvent) -> str:
         """用户询问今天自主发了几条、是否暂停、日常分享与回评状态时查看。次数与开关信息用此工具就够了；只有用户明确询问具体说说内容时再读列表。用当前角色口吻解释。"""
         return await self._run(event, lambda: self.service.user_status(event), action="status")
-
-    @filter.llm_tool(name="qzone_prepare_space")
-    async def bind_tool(self, event: AstrMessageEvent) -> str:
-        """管理员明确要启用或重新绑定当前角色的空间时调用，限私聊。不要无故更换绑定。"""
-        return await self._run(event, lambda: self.service.bind(event), action="bind")
 
     @filter.llm_tool(name="qzone_pause_or_resume")
     async def control_tool(self, event: AstrMessageEvent, action: str) -> str:

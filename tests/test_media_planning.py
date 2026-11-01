@@ -229,6 +229,17 @@ class PlanningTests(unittest.TestCase):
         items = parse_schedule("08:00 - 早餐\n09:00 - 咖啡")
         self.assertEqual(items, [{"time": "08:00", "activity": "早餐"}, {"time": "09:00", "activity": "咖啡"}])
 
+    def test_equal_range_keeps_a_quiet_boundary_until_the_next_activity(self):
+        items = parse_schedule("09:00 早餐\n10:00-10:00 午休\n12:00-13:00 午餐")
+        now = self.now.replace(hour=10, minute=30)
+        intervals = normalize_intervals(items, now)
+        self.assertEqual([row["activity"] for row in intervals], ["早餐", "午餐"])
+        self.assertEqual(intervals[0]["end"], now.replace(hour=10, minute=0))
+        slots = select_slots(items, now, "equal-rest", 2, self.settings)
+        self.assertEqual([row["activity"] for row in slots], ["午餐"])
+        self.assertTrue(all(row["slot_at"] >= now.replace(hour=12, minute=0).timestamp()
+                            for row in slots))
+
     def test_2400_is_only_valid_as_exact_midnight_ending(self):
         items = parse_schedule("23:00-24:00 看书\n24:00 出门\n23:00-24:01 散步")
         self.assertEqual(items, [
@@ -266,7 +277,7 @@ class PlanningTests(unittest.TestCase):
         )
         self.assertEqual(settings.auto_retry_count, 2)
         self.assertEqual(settings.auto_retry_first_minutes, 10)
-        self.assertEqual(settings.auto_retry_second_minutes, 30)
+        self.assertEqual(settings.auto_retry_second_minutes, 10)
 
     def test_invalid_time_does_not_become_a_post_opportunity(self):
         self.assertEqual(parse_schedule("25:00 出门\n14:99 咖啡\n没有时间的活动"), [])

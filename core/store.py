@@ -232,7 +232,7 @@ class StateStore:
         plan = json.loads(row[0])
         if plan["status"] == "done":
             return
-        retryable_failure = plan["status"] == "running" and plan.get("retry_version") == 1
+        retryable_failure = plan["status"] == "running" and plan.get("retry_version") in (1, 2)
         plan.update(status=status, next_attempt_at=None)
         if status == "done":
             plan.update(post_tid=str((result or {}).get("tid") or ""), stage="done")
@@ -713,18 +713,29 @@ class StateStore:
             plan = json.loads(row["record_json"])
             if now is not None and float(plan.get("next_attempt_at") or plan["slot_at"]) > now:
                 return False
-            plan["status"] = "running"
             if retry_delays is not None:
                 if now is None:
                     raise ValueError("A retry-aware claim needs its local timestamp")
+                attempts = int(plan.get("attempt_count", 0))
+                # Existing attempts belong to this opportunity even after a
+                # reload or policy change. Never enlarge its original budget.
+                budget = min(len(retry_delays), 2)
+                if attempts and "retry_delays" in plan:
+                    budget = min(budget, len(plan["retry_delays"]))
+                if attempts > budget:
+                    plan.update(status="skipped", stage="skipped", next_attempt_at=None,
+                                last_error_kind="retry_exhausted")
+                    self._write_plan(plan, time.time())
+                    return False
                 plan.setdefault("first_attempt_at", now)
                 plan.update(
-                    retry_version=1,
-                    attempt_count=int(plan.get("attempt_count", 0)) + 1,
-                    retry_delays=list(retry_delays),
+                    retry_version=2,
+                    attempt_count=attempts + 1,
+                    retry_delays=list(retry_delays[:budget]),
                     next_attempt_at=None,
                     stage="claimed",
                 )
+            plan["status"] = "running"
             cursor = self._db.execute(
                 "UPDATE plans SET status='running',record_json=?,updated_at=? "
                 "WHERE plan_id=? AND status='pending'",
@@ -738,6 +749,9 @@ class StateStore:
             "cached_image_path",
             "cached_summary",
             "cached_caption",
+            "cached_sharing_context",
+            "cached_share_focus",
+            "share_decided",
             "stage",
             "last_error_kind",
         }
@@ -755,13 +769,20 @@ class StateStore:
 
     @staticmethod
     def _plan_retry_state(plan: dict, error_kind: str, now: float) -> None:
-        """Choose the next absolute deadline without expanding the retry budget."""
+        """Wait after this failure without expanding the opportunity's budget."""
         attempts = int(plan.get("attempt_count", 0))
-        delays = plan.get("retry_delays", [])
+        delays = plan.get("retry_delays", [])[:2]
+        if plan.get("retry_version") == 1:
+            # Version 1 stored offsets from the first failure (+10/+30).
+            # Preserve its remaining attempt count, then adopt failure-relative
+            # waits. Already queued deadlines are kept by normal recovery.
+            delays = [600] * len(delays)
+            plan.update(retry_version=2, retry_delays=delays)
         expires = float(plan.get("expires_at", float(plan["slot_at"]) + 3600))
         plan.setdefault("first_failure_at", now)
+        plan["last_failure_at"] = now
         next_at = (
-            float(plan["first_failure_at"]) + float(delays[attempts - 1])
+            now + float(delays[attempts - 1])
             if 0 < attempts <= len(delays)
             else None
         )
@@ -912,7 +933,7 @@ class StateStore:
                     ):
                         self._sync_auto_plan(operation["key"], "failed", None, now)
                 elif plan["status"] == "running":
-                    if plan.get("retry_version") == 1 and plan.get("first_attempt_at"):
+                    if plan.get("retry_version") in (1, 2) and plan.get("first_attempt_at"):
                         self._plan_retry_state(plan, "interrupted_before_publish", now)
                     else:
                         # Legacy running rows lack evidence of their write stage.

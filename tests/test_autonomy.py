@@ -102,7 +102,7 @@ class AutonomyTests(IsolatedAsyncioTestCase):
             draft["content"],
         )
 
-    async def test_ten_and_thirty_minute_deadlines_survive_restart_and_exhaust_silently(self):
+    async def test_ten_minute_retry_waits_survive_restart_and_exhaust_silently(self):
         self.seed_due_plan("retry", 60)
         first = self.now.timestamp()
         self.integrations.selfie.side_effect = RuntimeError("secret provider URL")
@@ -122,8 +122,8 @@ class AutonomyTests(IsolatedAsyncioTestCase):
         self.now += timedelta(minutes=1)
         await self.run_due()
         plan = self.store.get_plan("retry")
-        self.assertEqual((plan["attempt_count"], plan["next_attempt_at"]), (2, first + 1800))
-        self.now += timedelta(minutes=20)
+        self.assertEqual((plan["attempt_count"], plan["next_attempt_at"]), (2, first + 1200))
+        self.now += timedelta(minutes=10)
         await self.run_due()
         plan = self.store.get_plan("retry")
         self.assertEqual((plan["status"], plan["attempt_count"]), ("skipped", 3))
@@ -162,6 +162,15 @@ class AutonomyTests(IsolatedAsyncioTestCase):
         self.now += timedelta(minutes=9)
         await self.run_due()
         self.integrations.selfie.assert_awaited_once()
+        self.now += timedelta(minutes=1)
+        await self.run_due()
+        saved = self.store.get_plan("slow")
+        self.assertEqual(saved["attempt_count"], 2)
+        self.assertEqual(saved["last_failure_at"], first + 1560)
+        self.assertEqual(saved["next_attempt_at"], first + 2160)
+        self.now += timedelta(minutes=9)
+        await self.run_due()
+        self.assertEqual(self.integrations.selfie.await_count, 2)
 
     async def test_caption_retry_reuses_image_and_summary(self):
         self.seed_due_plan("caption", 60)

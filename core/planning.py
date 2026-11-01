@@ -138,8 +138,13 @@ def normalize_intervals(activities, now: datetime, *, valid_until=None):
         activity = str(item.get("activity", "")).strip()
         explicit = "end_time" in item
         end = _minute(item.get("end_time"), ending=True) if explicit else None
-        if start is None or (explicit and (end is None or end == start)):
+        if start is None:
             continue
+        if explicit and (end is None or end == start):
+            # An invalid end still marks where the preceding activity stops.
+            # Keep the following interval quiet instead of extending an older
+            # activity through a zero-length rest or an unknown period.
+            end, activity = None, ""
         rows.append((start, end, activity))
     starts = sorted({row[0] for row in rows})
     boundaries = sorted(

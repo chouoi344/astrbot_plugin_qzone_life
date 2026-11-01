@@ -68,29 +68,76 @@ class StateStoreTests(unittest.TestCase):
             }
         )
 
-    def test_retry_deadlines_are_absolute_and_claims_are_due_and_atomic(self):
+    def test_retry_waits_follow_each_failure_and_claims_are_due_and_atomic(self):
         first = time.time()
         self.plan()
-        self.assertTrue(self.store.claim_plan("retry", now=first, retry_delays=[600, 1800]))
-        self.assertFalse(self.store.claim_plan("retry", now=first, retry_delays=[600, 1800]))
+        self.assertTrue(self.store.claim_plan("retry", now=first, retry_delays=[600, 600]))
+        self.assertFalse(self.store.claim_plan("retry", now=first, retry_delays=[600, 600]))
         self.store.update_plan("retry", cached_image_path="/cached.png", stage="vision")
         plan = self.store.schedule_plan_retry("retry", "vision_failed", now=first + 10)
         self.assertEqual((plan["status"], plan["next_attempt_at"]), ("pending", first + 610))
         self.assertEqual(plan["first_failure_at"], first + 10)
-        self.assertFalse(self.store.claim_plan("retry", now=first + 609, retry_delays=[600, 1800]))
-        self.assertTrue(self.store.claim_plan("retry", now=first + 610, retry_delays=[600, 1800]))
+        self.assertFalse(self.store.claim_plan("retry", now=first + 609, retry_delays=[600, 600]))
+        self.assertTrue(self.store.claim_plan("retry", now=first + 610, retry_delays=[600, 600]))
         plan = self.store.schedule_plan_retry("retry", "vision_failed", now=first + 620)
-        self.assertEqual(plan["next_attempt_at"], first + 1810)
+        self.assertEqual(plan["next_attempt_at"], first + 1220)
+        self.assertEqual(plan["last_failure_at"], first + 620)
         self.assertEqual(plan["cached_image_path"], "/cached.png")
-        self.assertTrue(self.store.claim_plan("retry", now=first + 1810, retry_delays=[600, 1800]))
-        plan = self.store.schedule_plan_retry("retry", "vision_failed", now=first + 1820)
+        self.assertTrue(self.store.claim_plan("retry", now=first + 1220, retry_delays=[600, 600]))
+        plan = self.store.schedule_plan_retry("retry", "vision_failed", now=first + 1230)
         self.assertEqual((plan["status"], plan["attempt_count"]), ("skipped", 3))
         self.assertIsNone(plan["next_attempt_at"])
+
+    def test_legacy_running_retry_adopts_ten_minutes_without_resetting_attempts(self):
+        first = time.time()
+        self.plan(status="running", retry_version=1, attempt_count=2,
+                  first_attempt_at=first - 900, first_failure_at=first - 300,
+                  retry_delays=[600, 1800])
+        self.store.close()
+        self.store = StateStore(self.path)
+        with patch("core.store.time.time", return_value=first):
+            self.store.recover_interrupted()
+        plan = self.store.get_plan("retry")
+        self.assertEqual((plan["retry_version"], plan["attempt_count"]), (2, 2))
+        self.assertEqual(plan["next_attempt_at"], first + 600)
+        self.assertTrue(self.store.claim_plan("retry", now=first + 600, retry_delays=[600, 600]))
+        plan = self.store.schedule_plan_retry("retry", "selfie_failed", now=first + 800)
+        self.assertEqual((plan["status"], plan["attempt_count"]), ("skipped", 3))
+
+    def test_policy_change_cannot_expand_an_existing_opportunity_budget(self):
+        first = time.time()
+        self.plan()
+        self.store.claim_plan("retry", now=first, retry_delays=[600])
+        self.store.schedule_plan_retry("retry", "selfie_failed", now=first + 100)
+        self.assertTrue(self.store.claim_plan("retry", now=first + 700, retry_delays=[600, 600]))
+        plan = self.store.schedule_plan_retry("retry", "selfie_failed", now=first + 710)
+        self.assertEqual((plan["status"], plan["attempt_count"]), ("skipped", 2))
+
+    def test_claim_refuses_a_legacy_pending_plan_that_already_used_three_attempts(self):
+        first = time.time()
+        self.plan(retry_version=1, attempt_count=3, retry_delays=[600, 1800])
+        self.assertFalse(self.store.claim_plan("retry", now=first, retry_delays=[600, 600]))
+        self.assertEqual(self.store.get_plan("retry")["attempt_count"], 3)
+        self.assertEqual(self.store.get_plan("retry")["status"], "skipped")
+
+    def test_retry_ending_at_activity_deadline_is_skipped(self):
+        first = time.time()
+        self.plan(expires_at=first + 800)
+        self.store.claim_plan("retry", now=first, retry_delays=[600, 600])
+        plan = self.store.schedule_plan_retry("retry", "selfie_failed", now=first + 200)
+        self.assertEqual(plan["status"], "skipped")
+        self.assertEqual(plan["last_error_kind"], "retry_window_expired")
 
     def test_stage_updates_are_explicit_and_reject_unsafe_metadata(self):
         self.plan()
         self.store.update_plan("retry", stage="caption", cached_summary="蓝色外套")
         self.assertEqual(self.store.get_plan("retry")["cached_summary"], "蓝色外套")
+        context = {"recent_posts": ["咖啡"]}
+        saved = self.store.update_plan("retry", cached_sharing_context=context,
+                                       cached_share_focus="休息片刻", share_decided=True)
+        context["recent_posts"].append("changed after save")
+        self.assertEqual(saved["cached_sharing_context"]["recent_posts"], ["咖啡"])
+        self.assertTrue(self.store.get_plan("retry")["share_decided"])
         with self.assertRaises(ValueError):
             self.store.update_plan("retry", provider_metadata={"token": "secret"})
         self.store.save_plan({**self.plan(), "stage": "replaced"})

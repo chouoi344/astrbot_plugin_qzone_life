@@ -57,3 +57,26 @@ class CaptionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(TimeoutError):
             await generate_caption(llm, object(), "照片摘要")
         llm.assert_awaited_once()
+
+    async def test_autonomous_caption_uses_chosen_real_relationship_and_recent_posts(self):
+        text = "今天穿了你说好看的那件黑外套，看来你的眼光确实值得听一回。"
+        llm = AsyncMock(return_value=text)
+        result = await generate_caption(
+            llm, object(), "穿黑外套在公园的单人自拍", activity="公园散步",
+            focus="分享今天的黑外套，轻轻回应用户的喜好",
+            sharing_context={"evidence": [{"id": "chat_1", "source": "用户本人", "text": "你穿黑色外套很好看"}],
+                             "recent_posts": ["今天想在海边吹风"]},
+        )
+        self.assertEqual(result, text)
+        prompt = llm.await_args.args[1]
+        self.assertIn("你穿黑色外套很好看", prompt)
+        self.assertIn("今天想在海边吹风", prompt)
+        self.assertIn("不引用私聊原文", prompt)
+
+    async def test_user_supplied_photo_does_not_acquire_autonomous_relationship_context(self):
+        llm = AsyncMock(return_value="这张照片里的晚霞很好看。")
+        await generate_caption(
+            llm, object(), "晚霞", sharing_context={"evidence": [{"id": "x", "text": "不应加入手动图的资料"}]},
+            focus="不应加入手动图的意图",
+        )
+        self.assertNotIn("不应加入手动图", llm.await_args.args[1])
