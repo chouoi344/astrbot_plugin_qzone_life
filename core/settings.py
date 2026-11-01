@@ -50,7 +50,7 @@ class Settings:
     min_gap_minutes: int = 180
     auto_retry_count: int = 2
     auto_retry_first_minutes: int = 10
-    auto_retry_second_minutes: int = 30
+    auto_retry_second_minutes: int = 10
     poll_seconds: int = 60
     watch_posts: int = 20
     max_replies_per_poll: int = 5

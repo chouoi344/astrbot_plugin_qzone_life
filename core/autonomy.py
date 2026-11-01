@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 
 from .caption import single_sentence
+from .events import SilentGenerationEvent
 from .planning import daily_target, schedule_hash
 
 
@@ -59,7 +60,7 @@ async def _check(service, event, binding, plan):
         raise
     except Exception:
         raise _StopOpportunity("binding_changed") from None
-    life = await service.current_life(binding)
+    life = await service.current_life(binding, force=True)
     if schedule_hash(life) != plan["schedule_hash"]:
         raise _StopOpportunity("schedule_changed")
     if not service.plan_matches_life(plan, life):
@@ -135,6 +136,7 @@ async def run_autonomous(service, event, binding):
                 raise
 
         try:
+            await final_check()
             operation = service.store.get_operation(key)
             # Once an external write was attempted, its immutable payload is the
             # sole retry source. Never replace a missing original with a new image.
@@ -165,6 +167,20 @@ async def run_autonomous(service, event, binding):
                 )
             path = plan.get("cached_image_path")
             if not path or not Path(path).is_file():
+                if not plan.get("share_decided"):
+                    stage = "sharing_intent"
+                    context, decision = await service.prepare_share(
+                        event, binding, plan["activity"], life.get("outfit", "")
+                    )
+                    await final_check()
+                    if not decision["share"]:
+                        _terminal(service, plan, "skipped", "nothing_to_share")
+                        break
+                    plan = service.store.update_plan(
+                        plan["plan_id"], cached_sharing_context=context,
+                        cached_share_focus=decision["focus"], share_decided=True,
+                    )
+                stage = "selfie"
                 service.store.update_plan(
                     plan["plan_id"], stage="selfie", cached_summary="", cached_caption=""
                 )
@@ -173,8 +189,15 @@ async def run_autonomous(service, event, binding):
                     f"今日穿搭：{life.get('outfit', '')}。画面只表现当前活动，"
                     "不混入今天其他时间的场景；保持已设置角色参考形象。"
                 )
+                if plan.get("cached_share_focus"):
+                    prompt += (
+                        f"\n这次想记录的生活片刻：{plan['cached_share_focus']}。"
+                        "动作和构图自然，仍然只拍角色自己，不添加用户或另一位人物，"
+                        "不要把聊天内容写成画面中的文字，不添加日程外的地点、物品或经历。"
+                    )
                 path, _ = await asyncio.wait_for(
-                    service.integrations.selfie(event, prompt), service.settings.selfie_timeout
+                    service.integrations.selfie(SilentGenerationEvent(event), prompt),
+                    service.settings.selfie_timeout,
                 )
                 if not Path(path).is_file():
                     raise ValueError("自拍文件缺失")
@@ -197,7 +220,11 @@ async def run_autonomous(service, event, binding):
                 text = ""
             if not text:
                 service.store.update_plan(plan["plan_id"], stage=stage)
-                text = await service.generate_caption(event, summary, activity=plan["activity"])
+                text = await service.generate_caption(
+                    event, summary, activity=plan["activity"],
+                    sharing_context=plan.get("cached_sharing_context"),
+                    focus=plan.get("cached_share_focus", ""),
+                )
                 if not isinstance(text, str) or not text.strip() or len(text) > 2000:
                     raise ValueError("配文内容无效")
                 plan = service.store.update_plan(plan["plan_id"], cached_caption=text)

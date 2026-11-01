@@ -142,28 +142,32 @@ class Integrations:
         return (str(persona_id) if persona_id else None), _prompt(persona)
 
     async def life_context(self) -> dict[str, Any]:
+        """Read the existing dated cache; this bridge never generates a day.
+
+        The upstream public getter uses the server's naive local clock. Reading
+        its dated data manager directly avoids combining a day chosen by that
+        clock with the AstrBot scheduler's timezone.
+        """
         peer = find_plugin(self.context, "astrbot_plugin_life_scheduler")
-        getter = getattr(peer, "get_life_context", None)
-        if not callable(getter):
-            raise IntegrationIncompatible("日程插件缺少 get_life_context 接口")
         generator = getattr(peer, "generator", None)
         generation_started = getattr(generator, "_generating", False) is True
-        try:
-            result = await _await(getter(allow_generate=False))
-        except TypeError as exc:
-            # A parameterless retry could create a new schedule through an LLM.
-            raise IntegrationIncompatible("日程插件不支持只读日程查询") from exc
-        if not isinstance(result, dict):
-            raise IntegrationIncompatible("日程插件返回的数据格式不兼容")
-        if not result:
-            return result
         config = getattr(peer, "config", None)
         manager = getattr(peer, "data_mgr", None)
-        # Older/fake peers may expose only the public read-only method. Preserve
-        # that contract; Life Scheduler 2.8 adds a readable, dated cache.
         if not callable(getattr(config, "get", None)) or not callable(
             getattr(manager, "get", None)
         ):
+            getter = getattr(peer, "get_life_context", None)
+            if not callable(getter):
+                raise IntegrationIncompatible("日程插件缺少只读日程接口")
+            try:
+                inspect.signature(getter).bind(allow_generate=False)
+            except (TypeError, ValueError) as exc:
+                raise IntegrationIncompatible("日程插件不支持只读日程查询") from exc
+            # A TypeError *inside* a compatible getter is its actual failure,
+            # not evidence that allow_generate is unsupported.
+            result = await _await(getter(allow_generate=False))
+            if not isinstance(result, dict):
+                raise IntegrationIncompatible("日程插件返回的数据格式不兼容")
             return result
         utils = _peer_module(peer, "core.utils")
         resolve = getattr(utils, "resolve_business_now", None)
@@ -182,7 +186,6 @@ class Integrations:
         business_now = resolve(schedule_time, now=now)
         data = await _await(manager.get(business_now))
         if data is None:
-            # A refresh boundary may have crossed during the public read.
             return {}
         data_field = (
             data.get
@@ -190,27 +193,23 @@ class Integrations:
             else lambda key, default=None: getattr(data, key, default)
         )
         source_day = str(data_field("date", ""))
-        if not source_day:
-            return result
-        if source_day != str(business_now.date()):
+        if source_day != str(business_now.date()) or data_field("status", "ok") != "ok":
             return {}
-        # Do not attach a newer cache date to an older snapshot or extend a
-        # removed/changed schedule while the upstream refresh is in progress.
-        for field in ("schedule", "outfit"):
-            cached = data_field(field)
-            if field in result and cached is not None and str(result[field]) != str(cached):
-                return {}
+        schedule, outfit = data_field("schedule"), data_field("outfit")
+        if not isinstance(schedule, str) or not schedule.strip():
+            return {}
+        if not isinstance(outfit, str) or not outfit.strip():
+            return {}
         hour, minute = parse_time(schedule_time)
         boundary = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if boundary <= now:
             boundary += timedelta(days=1)
-        meta = result.get("meta", {})
-        if not isinstance(meta, dict):
-            raise IntegrationIncompatible("日程插件返回的元数据格式不兼容")
         return {
-            **result,
+            "schedule": schedule,
+            "outfit": outfit,
+            "timeline": [],
             "meta": {
-                **meta,
+                "style": str(data_field("outfit_style", "") or ""),
                 "qzone_schedule_day": source_day,
                 "qzone_valid_until": boundary.timestamp(),
                 "qzone_generation_in_progress": generation_started
