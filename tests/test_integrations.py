@@ -365,6 +365,17 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             await self.bridge.life_context()
         self.assertEqual(calls, [])
 
+    async def test_life_internal_type_error_keeps_its_real_cause(self):
+        async def broken(*, allow_generate):
+            self.assertFalse(allow_generate)
+            raise TypeError("internal cache decoding failed")
+
+        self.peers["astrbot_plugin_life_scheduler"] = types.SimpleNamespace(
+            star_cls=types.SimpleNamespace(get_life_context=broken), activated=True
+        )
+        with self.assertRaisesRegex(TypeError, "internal cache decoding failed"):
+            await self.bridge.life_context()
+
     def dated_life_fixture(self, now, business_now):
         result = {"outfit": "外套", "schedule": "00:00-02:00 看书", "meta": {"style": "日常"}}
         record = types.SimpleNamespace(
@@ -404,7 +415,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             result["meta"]["qzone_valid_until"], now.replace(hour=7, minute=0).timestamp()
         )
         self.assertEqual(original["meta"], {"style": "日常"})
-        peer.get_life_context.assert_awaited_once_with(allow_generate=False)
+        peer.get_life_context.assert_not_awaited()
         peer.data_mgr.get.assert_called_once_with(business_now)
         utils.resolve_business_now.assert_called_once_with("07:00", now=now)
 
@@ -440,12 +451,12 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         peer, original, record, utils, clock = self.dated_life_fixture(now, now)
         peer.generator = types.SimpleNamespace(_generating=True)
 
-        async def finishing_read(*, allow_generate):
-            self.assertFalse(allow_generate)
+        async def finishing_read(day):
+            self.assertEqual(day, now)
             peer.generator._generating = False
-            return original
+            return record
 
-        peer.get_life_context = finishing_read
+        peer.data_mgr.get = finishing_read
         with (
             patch.dict(sys.modules, {"test_life.core.utils": utils}),
             patch.object(mod, "datetime", clock),
@@ -454,7 +465,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["meta"]["qzone_generation_in_progress"])
         self.assertFalse(peer.generator._generating)
 
-    async def test_life_snapshot_changing_during_refresh_is_not_misdated(self):
+    async def test_life_reads_dated_cache_without_naive_public_getter(self):
         now = datetime(2026, 10, 25, 7, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
         peer, original, record, utils, clock = self.dated_life_fixture(now, now)
         record.schedule = "08:00-09:00 新日程"
@@ -462,6 +473,36 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             patch.dict(sys.modules, {"test_life.core.utils": utils}),
             patch.object(mod, "datetime", clock),
         ):
+            life = await self.bridge.life_context()
+        self.assertEqual(life["schedule"], "08:00-09:00 新日程")
+        self.assertEqual(life["meta"]["qzone_schedule_day"], "2026-10-25")
+        peer.get_life_context.assert_not_awaited()
+
+    async def test_life_dated_cache_works_even_with_legacy_public_signature(self):
+        now = datetime(2026, 10, 25, 8, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        peer, original, record, utils, clock = self.dated_life_fixture(now, now)
+
+        async def legacy():
+            self.fail("dated cache reader must never call the naive public getter")
+
+        peer.get_life_context = legacy
+        with (
+            patch.dict(sys.modules, {"test_life.core.utils": utils}),
+            patch.object(mod, "datetime", clock),
+        ):
+            self.assertEqual((await self.bridge.life_context())["schedule"], record.schedule)
+
+    async def test_failed_or_incomplete_dated_cache_is_unavailable(self):
+        now = datetime(2026, 10, 25, 8, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        peer, original, record, utils, clock = self.dated_life_fixture(now, now)
+        record.status = "failed"
+        with (
+            patch.dict(sys.modules, {"test_life.core.utils": utils}),
+            patch.object(mod, "datetime", clock),
+        ):
+            self.assertEqual(await self.bridge.life_context(), {})
+            record.status = "ok"
+            record.outfit = ""
             self.assertEqual(await self.bridge.life_context(), {})
 
     async def test_missing_or_wrong_day_cache_does_not_extend_old_schedule(self):

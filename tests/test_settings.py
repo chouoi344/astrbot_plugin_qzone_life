@@ -124,7 +124,7 @@ class SimpleSettingsTests(unittest.TestCase):
         self.assertEqual(settings.poll_seconds, 60)
         self.assertEqual(settings.selfie_timeout, 600)
         self.assertEqual(
-            (settings.auto_retry_first_minutes, settings.auto_retry_second_minutes), (10, 30)
+            (settings.auto_retry_first_minutes, settings.auto_retry_second_minutes), (10, 10)
         )
 
     def test_text_model_choice_and_explicit_empty_choice_are_preserved(self):
@@ -149,7 +149,7 @@ class SimpleSettingsTests(unittest.TestCase):
                 self.assertEqual(settings.auto_retry_count, retries)
                 self.assertEqual(
                     (settings.auto_retry_first_minutes, settings.auto_retry_second_minutes),
-                    (10, 30),
+                    (10, 10),
                 )
 
     def test_legacy_retry_disabled_migrates_once_and_explicit_choice_takes_precedence(self):

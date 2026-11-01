@@ -31,10 +31,10 @@ class PersonaFollowTests(unittest.IsolatedAsyncioTestCase):
         self.integrations.life.update(schedule="11:00-17:00 图书馆阅读", outfit="新角色的衬衫")
         self.assertEqual(await self.service.current_life(current), self.integrations.life)
 
-    async def test_explicit_bind_cannot_bypass_old_schedule_guard(self):
+    async def test_automatic_setup_preserves_old_schedule_guard(self):
         await self.service.current_life(self.binding)
         self.integrations.binding["persona_id"] = "new-role"
-        await self.service.bind(self.event)
+        await self.service.ensure_ready(self.event)
         current = self.store.get_value("binding")
         self.assertEqual(current["persona_id"], "new-role")
         self.assertEqual(await self.service.current_life(current), {})

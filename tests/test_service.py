@@ -119,6 +119,10 @@ class ServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
             close=AsyncMock(),
         )
         self.store = StateStore(self.directory / "state.sqlite3")
+
+        async def snapshot(**kwargs):
+            return await self.integrations.life_context()
+
         self.service = service_module.QzoneService(
             self.context,
             {"daily_min": 2, "daily_max": 2, "timezone": "Asia/Shanghai"},
@@ -132,11 +136,19 @@ class ServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 sender=binding["admin_id"],
                 self_id=binding["bot_id"],
             ),
+            schedule_snapshots=SimpleNamespace(
+                get=AsyncMock(side_effect=snapshot),
+                close=Mock(),
+            ),
         )
         self.service.settings.daily_min = self.service.settings.daily_max = 2
         self.service.now = lambda: self.now
         self.service.photo_summary = AsyncMock(return_value="蓝色外套，咖啡店")
         self.service.llm = AsyncMock(return_value="今天在咖啡店休息。")
+        self.service.prepare_share = AsyncMock(return_value=(
+            {"evidence": [], "recent_posts": []},
+            {"share": True, "focus": "咖啡店休息", "related_evidence": []},
+        ))
         self.store.set_value("binding", self.binding)
         self.store.set_value("activated_at", 0)
         self.image_patch = patch.object(
@@ -633,10 +645,10 @@ class ServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, "failed")
         self.assertEqual(self.store.list_posts(), [])
 
-    async def test_explicit_rebind_follows_current_persona(self):
+    async def test_automatic_setup_follows_current_persona(self):
         self.integrations.binding["persona_id"] = "new-role"
-        response = await self.service.bind(self.event)
-        self.assertEqual(response.status, "done")
+        response = await self.service.ensure_ready(self.event)
+        self.assertEqual(response["persona_id"], "new-role")
         self.assertEqual(self.store.get_value("binding")["persona_id"], "new-role")
 
     async def test_self_like_revalidates_permission_and_defers_on_pause(self):
@@ -751,7 +763,9 @@ class ServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
             service_module, "logger"
         ) as host_logger:
             await self.service.loop()
-        host_logger.warning.assert_called_once_with("QQ空间后台任务等待恢复：%s", failure)
+        host_logger.warning.assert_called_once_with(
+            "QQ空间后台任务等待恢复：%s", failure, exc_info=True
+        )
         self.assertEqual(self.store.get_value("last_background_error"), str(failure))
         self.transport.publish.assert_not_awaited()
 
