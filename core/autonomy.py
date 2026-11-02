@@ -30,16 +30,17 @@ def _unresolved(service, binding, own_key: str = "") -> bool:
 
 def _quota_full(service, binding) -> bool:
     day = str(service.now().date())
-    return service.store.count_autonomous(day) >= daily_target(
+    return service.store.count_autonomous(day, binding["bot_id"]) >= daily_target(
         day, binding["bot_id"], service.settings.daily_min, service.settings.daily_max
     )
 
 
-def _too_close(service) -> bool:
+def _too_close(service, binding) -> bool:
     previous = [
         post
         for post in service.store.list_posts(limit=200, include_deleted=True)
         if post["source"] == "autonomous"
+        and str(post["binding"].get("bot_id")) == str(binding["bot_id"])
     ]
     return bool(
         previous
@@ -67,7 +68,7 @@ async def _check(service, event, binding, plan):
         raise _StopOpportunity("outside_schedule_activity")
     if _quota_full(service, binding):
         raise _StopOpportunity("daily_quota_reached")
-    if _too_close(service):
+    if _too_close(service, binding):
         raise _StopOpportunity("minimum_gap")
     if _unresolved(service, binding, "auto:" + plan["plan_id"]):
         raise _StopOpportunity("other_publish_unknown")
@@ -79,7 +80,7 @@ def _terminal(service, plan, state, reason):
     service.store.set_value("last_autonomous_result", "本次自主分享已静默跳过")
 
 
-async def run_autonomous(service, event, binding):
+async def run_autonomous(service, event, binding, *, binding_verified=False):
     """Execute at most one due attempt; never send a chat message.
 
     The runtime owns its service lock. SQLite claims prevent two workers from
@@ -88,7 +89,8 @@ async def run_autonomous(service, event, binding):
     if not service.settings.auto_publish or service.store.get_value("paused", False):
         return
     service.store.expire_previous_plans(str(service.now().date()))
-    await service.verify_binding(event, binding)
+    if not binding_verified:
+        await service.verify_binding(event, binding)
     await service.integrations.check_life_persona(binding)
     if _unresolved(service, binding):
         service.store.set_value("schedule_status", "自主分享结果待核对，后续自主分享已暂停")
@@ -118,7 +120,7 @@ async def run_autonomous(service, event, binding):
         if int(plan.get("attempt_count", 0)) > len(delays):
             _terminal(service, plan, "skipped", "retry_disabled" if not delays else "retry_exhausted")
             continue
-        if float(plan.get("next_attempt_at") or plan["slot_at"]) > now or _too_close(service):
+        if float(plan.get("next_attempt_at") or plan["slot_at"]) > now or _too_close(service, binding):
             continue
         if not service.store.claim_plan(plan["plan_id"], now=now, retry_delays=delays):
             continue

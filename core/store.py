@@ -499,12 +499,15 @@ class StateStore:
         with self._lock:
             return [json.loads(row[0]) for row in self._db.execute(sql, (max(0, limit),))]
 
-    def count_autonomous(self, local_day: str) -> int:
+    def count_autonomous(self, local_day: str, bot_id: str | None = None) -> int:
         """Count successful autonomous publications, including later-deleted ones."""
+        sql = "SELECT COUNT(*) FROM posts WHERE source='autonomous' AND local_day=?"
+        params = [local_day]
+        if bot_id is not None:
+            sql += " AND CAST(json_extract(record_json, '$.binding.bot_id') AS TEXT)=?"
+            params.append(str(bot_id))
         with self._lock:
-            return self._db.execute(
-                "SELECT COUNT(*) FROM posts WHERE source='autonomous' AND local_day=?", (local_day,)
-            ).fetchone()[0]
+            return self._db.execute(sql, params).fetchone()[0]
 
     def get_comment(self, key: str) -> dict | None:
         """Return a comment, its processing status and actual reply, if present."""

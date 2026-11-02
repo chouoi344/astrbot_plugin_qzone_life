@@ -97,6 +97,60 @@ class Integrations:
         self.context = context
         self._memory_lock = asyncio.Lock()
 
+    async def _memory_persona_id(self, event: Any, storage: Any) -> str | None:
+        """Read LivingMemory's selection order without its per-call INFO log.
+
+        Use the same public AstrBot session/conversation/default APIs as the
+        supported LivingMemory bridge. Do not suppress its logger globally or
+        cache the choice: switching personas must affect the very next check.
+        Missing/unreadable APIs stop the caller rather than inventing a default.
+        """
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        if not umo:
+            raise BindingMismatch("缺少角色绑定会话")
+
+        def selected(value):
+            if value is not None and not isinstance(value, str):
+                raise IntegrationIncompatible("AstrBot 人格标识格式不兼容")
+            return None if value in (None, "", "[%None]") else value
+
+        getter = getattr(storage, "get_async", None)
+        if not callable(getter):
+            raise IntegrationIncompatible("AstrBot 缺少会话人格读取接口")
+        services = await _await(getter(
+            scope="umo", scope_id=umo, key="session_service_config", default={}
+        ))
+        if not isinstance(services, dict):
+            raise IntegrationIncompatible("AstrBot 会话设置格式不兼容")
+        session_persona = services.get("persona_id")
+        if session_persona:
+            return selected(session_persona)
+
+        conversations = getattr(self.context, "conversation_manager", None)
+        current = getattr(conversations, "get_curr_conversation_id", None)
+        read = getattr(conversations, "get_conversation", None)
+        if not callable(current) or not callable(read):
+            raise IntegrationIncompatible("AstrBot 缺少当前会话人格读取接口")
+        cid = await _await(current(umo))
+        if cid is not None:
+            conversation = await _await(read(umo, cid))
+            if conversation is not None and not hasattr(conversation, "persona_id"):
+                raise IntegrationIncompatible("AstrBot 会话人格格式不兼容")
+            conversation_persona = getattr(conversation, "persona_id", None)
+            if conversation_persona:
+                return selected(conversation_persona)
+
+        manager = getattr(self.context, "persona_manager", None)
+        default = getattr(manager, "get_default_persona_v3", None)
+        if not callable(default):
+            raise IntegrationIncompatible("AstrBot 缺少默认人格读取接口")
+        persona = await _await(default(umo=umo))
+        if persona is None or persona == {}:
+            return None
+        if not isinstance(persona, dict) or "name" not in persona:
+            raise IntegrationIncompatible("AstrBot 默认人格格式不兼容")
+        return selected(persona["name"])
+
     async def persona(self, event: Any) -> tuple[str | None, str]:
         """Resolve the real selected character, never a made-up fallback prompt."""
         umo = str(getattr(event, "unified_msg_origin", "") or "")
@@ -128,7 +182,7 @@ class Integrations:
         else:
             peer = self._memory_peer()
             utils = _peer_module(peer, "core.utils")
-            persona_id = await utils.get_persona_id(self.context, event)
+            persona_id = await self._memory_persona_id(event, utils.sp)
             persona = None
         if persona_id == "[%None]":
             persona_id = None
@@ -330,7 +384,7 @@ class Integrations:
         admin_id = _value(event, "get_sender_id")
         if not all((umo, bot_id, admin_id)):
             raise BindingMismatch("记忆绑定缺少会话、机器人账号或管理员身份")
-        persona_id = await utils.get_persona_id(self.context, event)
+        persona_id = await self._memory_persona_id(event, utils.sp)
         if persona_id == "[%None]":
             persona_id = None
         if expected_persona_id is not None and str(persona_id or "") != str(expected_persona_id):
