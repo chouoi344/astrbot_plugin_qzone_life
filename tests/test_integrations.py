@@ -157,17 +157,24 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.peers = {
             "astrbot_plugin_livingmemory": types.SimpleNamespace(activated=True, star_cls=self.peer)
         }
-        self.context = types.SimpleNamespace(get_registered_star=lambda name: self.peers.get(name))
+        self.context = types.SimpleNamespace(
+            get_registered_star=lambda name: self.peers.get(name),
+            conversation_manager=types.SimpleNamespace(
+                get_curr_conversation_id=AsyncMock(return_value=None),
+                get_conversation=AsyncMock(return_value=None),
+            ),
+            persona_manager=types.SimpleNamespace(
+                get_default_persona_v3=AsyncMock(side_effect=lambda **kwargs: {"name": self.persona_id}),
+            ),
+        )
         scope_module = types.ModuleType("test_lmem.core.memory_scope")
         scope_module.is_event_memory_allowed = lambda cfg, event: self.allowed
         scope_module.resolve_memory_scope = lambda cfg, event: self.scope
         utils = types.ModuleType("test_lmem.core.utils")
         utils.sp = self.storage
 
-        async def get_persona_id(context, event):
-            return self.persona_id
-
-        utils.get_persona_id = get_persona_id
+        utils.get_persona_id = AsyncMock(side_effect=AssertionError("no noisy persona helper"))
+        self.memory_utils = utils
         api = types.ModuleType("astrbot.api")
         api.sp = self.storage
         self.module_patch = patch.dict(
@@ -237,6 +244,83 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(mod.BindingMismatch):
             await self.bridge.sync_memory(self.event, payload)
         self.assertEqual(self.engine.add_calls, 0)
+
+    async def test_session_persona_takes_priority_without_reading_conversation_or_default(self):
+        self.storage.values["session_service_config"] = {"persona_id": "会话选择"}
+        binding = await self.bridge.resolve_binding(self.event)
+        self.assertEqual(binding["persona_id"], "会话选择")
+        self.context.conversation_manager.get_curr_conversation_id.assert_not_awaited()
+        self.context.persona_manager.get_default_persona_v3.assert_not_awaited()
+        self.memory_utils.get_persona_id.assert_not_awaited()
+
+    async def test_conversation_persona_takes_priority_over_default(self):
+        conversations = self.context.conversation_manager
+        conversations.get_curr_conversation_id.return_value = "chat-1"
+        conversations.get_conversation.return_value = types.SimpleNamespace(persona_id="会话角色")
+        binding = await self.bridge.resolve_binding(self.event)
+        self.assertEqual(binding["persona_id"], "会话角色")
+        conversations.get_conversation.assert_awaited_once_with(self.event.unified_msg_origin, "chat-1")
+        self.context.persona_manager.get_default_persona_v3.assert_not_awaited()
+        self.memory_utils.get_persona_id.assert_not_awaited()
+
+    async def test_explicit_no_persona_stops_fallback_for_both_override_levels(self):
+        self.storage.values["session_service_config"] = {"persona_id": "[%None]"}
+        self.assertIsNone((await self.bridge.resolve_binding(self.event))["persona_id"])
+        self.storage.values.clear()
+        conversations = self.context.conversation_manager
+        conversations.get_curr_conversation_id.return_value = "chat-1"
+        conversations.get_conversation.return_value = types.SimpleNamespace(persona_id="[%None]")
+        self.assertIsNone((await self.bridge.resolve_binding(self.event))["persona_id"])
+        self.context.persona_manager.get_default_persona_v3.assert_not_awaited()
+
+    async def test_idle_reads_are_quiet_and_default_changes_apply_immediately(self):
+        for _ in range(3):
+            self.assertEqual((await self.bridge.resolve_binding(self.event))["persona_id"], "角色 A")
+        self.persona_id = "角色 B"
+        self.assertEqual((await self.bridge.resolve_binding(self.event))["persona_id"], "角色 B")
+        self.context.persona_manager.get_default_persona_v3.assert_awaited_with(
+            umo=self.event.unified_msg_origin
+        )
+        self.memory_utils.get_persona_id.assert_not_awaited()
+
+    async def test_missing_default_persona_remains_unselected(self):
+        default = self.context.persona_manager.get_default_persona_v3
+        default.side_effect = None
+        for value in (None, {}, {"name": None}):
+            with self.subTest(value=value):
+                default.return_value = value
+                self.assertIsNone((await self.bridge.resolve_binding(self.event))["persona_id"])
+
+    async def test_persona_read_failure_stops_memory_write_without_default_fallback(self):
+        payload = await self.payload()
+        default = self.context.persona_manager.get_default_persona_v3
+        default.reset_mock()
+        self.context.conversation_manager.get_curr_conversation_id.side_effect = OSError("unreadable")
+        with self.assertRaises(OSError):
+            await self.bridge.sync_memory(self.event, payload)
+        default.assert_not_awaited()
+        self.assertEqual(self.engine.add_calls, 0)
+        self.memory_utils.get_persona_id.assert_not_awaited()
+
+    async def test_missing_persona_api_and_malformed_default_block_memory_write(self):
+        payload = await self.payload()
+        default = self.context.persona_manager.get_default_persona_v3
+        default.side_effect = None
+        default.return_value = {"unexpected": "角色 A"}
+        with self.assertRaises(mod.IntegrationIncompatible):
+            await self.bridge.sync_memory(self.event, payload)
+        self.context.persona_manager.get_default_persona_v3 = None
+        with self.assertRaises(mod.IntegrationIncompatible):
+            await self.bridge.sync_memory(self.event, payload)
+        self.assertEqual(self.engine.add_calls, 0)
+        self.memory_utils.get_persona_id.assert_not_awaited()
+
+    async def test_legacy_persona_prompt_lookup_also_avoids_noisy_helper(self):
+        self.context.persona_manager.get_persona_v3_by_id = AsyncMock(
+            return_value={"prompt": "设定正文"}
+        )
+        self.assertEqual(await self.bridge.persona(self.event), ("角色 A", "设定正文"))
+        self.memory_utils.get_persona_id.assert_not_awaited()
 
     async def test_whitelist_initialization_and_disable_are_enforced(self):
         self.allowed = False

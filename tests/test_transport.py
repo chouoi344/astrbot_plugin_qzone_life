@@ -12,7 +12,7 @@ import aiohttp
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from astrbot_plugin_qzone_life.core.transport import QzoneReadError, QzoneTransport
+from astrbot_plugin_qzone_life.core.transport import AccountIdentityError, QzoneReadError, QzoneTransport
 from astrbot_plugin_qzone_life.vendor.qzone_protocol import parse_response, upload_fields
 
 
@@ -94,6 +94,119 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "账号已变化"):
             await self.transport.identity()
         self.assertIsNone(self.transport._credentials)
+
+    async def test_forced_identity_checks_cookie_again_inside_ttl(self):
+        await self.transport.identity()
+        self.transport.client.get_cookies = AsyncMock(return_value={
+            "cookies": "uin=o20002; p_skey=private-cookie",
+        })
+        with self.assertRaises(AccountIdentityError) as caught:
+            await self.transport.identity(force=True)
+        self.assertNotIn("private-cookie", str(caught.exception))
+        self.assertIsNone(self.transport._credentials)
+        self.assertEqual(self.transport.expected_uin, 10001)
+        self.transport.client.get_cookies.assert_awaited_once()
+        self.transport._request.assert_not_awaited()
+
+    async def test_identity_recovers_without_rebinding_after_cookie_is_corrected(self):
+        self.transport.client.get_cookies = AsyncMock(side_effect=[
+            {"cookies": "uin=o20002; p_skey=wrong"},
+            {"cookies": "uin=o10001; p_skey=recovered"},
+        ])
+        with self.assertRaises(AccountIdentityError):
+            await self.transport.identity(force=True)
+        self.assertEqual((await self.transport.identity(force=True))["uin"], 10001)
+        self.assertEqual(self.transport._credentials.p_skey, "recovered")
+        self.transport._request.assert_not_awaited()
+
+    async def test_cached_identity_rejects_unavailable_or_conflicting_login_and_clears_cache(self):
+        client = self.transport.client
+        for response in (
+            {}, {"user_id": True}, {"user_id": ""}, {"user_id": 10001, "self_id": 20002},
+            {"status": "failed", "retcode": 1, "data": {"user_id": 10001}},
+            {"status": "ok", "retcode": False, "data": {"user_id": 10001}},
+            {"status": "ok", "data": []},
+        ):
+            with self.subTest(response=response):
+                client.get_login_info = AsyncMock(return_value={"user_id": 10001})
+                await self.transport.identity(force=True)
+                client.get_login_info.return_value = response
+                with self.assertRaises(AccountIdentityError):
+                    await self.transport.identity()
+                self.assertIsNone(self.transport._credentials)
+        self.transport._request.assert_not_awaited()
+
+    async def test_login_rpc_error_is_sanitized_and_invalidates_cached_cookie(self):
+        await self.transport.identity()
+        self.transport.client.get_login_info = AsyncMock(side_effect=RuntimeError("private-token"))
+        with self.assertRaises(AccountIdentityError) as caught:
+            await self.transport.identity()
+        self.assertNotIn("private-token", str(caught.exception))
+        self.assertIsNone(self.transport._credentials)
+
+    async def test_login_changes_during_cookie_read_are_rejected(self):
+        self.transport.client.get_login_info = AsyncMock(side_effect=[
+            {"user_id": 10001}, {"user_id": 20002},
+        ])
+        with self.assertRaises(AccountIdentityError):
+            await self.transport.identity(force=True)
+        self.assertIsNone(self.transport._credentials)
+        self.transport._request.assert_not_awaited()
+
+    async def test_multiple_or_disconnected_reverse_accounts_block_cached_reads(self):
+        client = self.transport.client
+        for connections in ({}, {"10001": object(), "20002": object()}, {"20002": object()}):
+            with self.subTest(accounts=list(connections)):
+                client._wsr_api_clients = {"10001": object()}
+                await self.transport.identity(force=True)
+                client._wsr_api_clients = connections
+                with self.assertRaises(AccountIdentityError):
+                    await self.transport.list_posts()
+                self.assertIsNone(self.transport._credentials)
+        self.transport._request.assert_not_awaited()
+
+    async def test_same_account_reconnect_refreshes_cookie_inside_ttl(self):
+        client = self.transport.client
+        client._wsr_api_clients = {"10001": object()}
+        await self.transport.identity()
+        client.get_cookies = AsyncMock(return_value={"cookies": "uin=o10001; p_skey=new"})
+        client._wsr_api_clients["10001"] = object()
+        self.assertEqual((await self.transport.identity())["uin"], 10001)
+        client.get_cookies.assert_awaited_once()
+        self.assertEqual(self.transport._credentials.p_skey, "new")
+
+    async def test_reconnect_during_cookie_rpc_does_not_keep_old_connection_credentials(self):
+        client = self.transport.client
+        client._wsr_api_clients = {"10001": object()}
+
+        async def reconnect(**kwargs):
+            client._wsr_api_clients["10001"] = object()
+            return {"cookies": "uin=o10001; p_skey=old-connection"}
+
+        client.get_cookies = AsyncMock(side_effect=reconnect)
+        with self.assertRaises(AccountIdentityError):
+            await self.transport.identity(force=True)
+        self.assertIsNone(self.transport._credentials)
+        self.transport._request.assert_not_awaited()
+
+    async def test_wrapped_login_and_cookie_responses_use_same_account(self):
+        self.transport.client.get_login_info = AsyncMock(return_value={
+            "status": "ok", "retcode": 0, "data": {"user_id": "10001", "nickname": "角色"},
+        })
+        self.transport.client.get_cookies = AsyncMock(return_value={
+            "status": "ok", "retcode": "0", "data": {"cookies": "uin=o10001; p_skey=wrapped"},
+        })
+        self.assertEqual(await self.transport.identity(force=True), {"uin": 10001, "nickname": "角色"})
+        self.transport._request.assert_not_awaited()
+
+    async def test_failed_cookie_response_does_not_override_failure_with_data(self):
+        self.transport.client.get_cookies = AsyncMock(return_value={
+            "status": "failed", "retcode": 1, "data": {"cookies": "uin=o10001; p_skey=private"},
+        })
+        with self.assertRaises(AccountIdentityError):
+            await self.transport.identity(force=True)
+        self.assertIsNone(self.transport._credentials)
+        self.transport._request.assert_not_awaited()
 
     async def test_read_all_images_before_any_upload(self):
         result = await self.transport.publish(
