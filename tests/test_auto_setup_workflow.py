@@ -40,11 +40,12 @@ class AutoSetupWorkflowTests(IsolatedAsyncioTestCase):
         self.transport.identity.assert_not_awaited()
         self.assertIsNone(self.store.get_value("binding"))
 
-    async def test_existing_valid_session_is_preserved_without_setup_message_or_login_call(self):
-        with patch.object(fixtures.service_module, "discover_session", new_callable=AsyncMock) as discover:
+    async def test_existing_session_rechecks_login_and_cookies_then_reuses_short_check(self):
+        with patch.object(fixtures.service_module, "discover_session", return_value=self.event) as discover:
             self.assertEqual(await self.service.ensure_ready(), self.binding)
-        discover.assert_not_awaited()
-        self.transport.identity.assert_not_awaited()
+            self.assertEqual(await self.service.ensure_ready(), self.binding)
+        discover.assert_awaited_once()
+        self.transport.identity.assert_awaited_once_with(force=True)
 
     async def test_admin_removal_adopts_current_admin_and_preserves_historical_ownership(self):
         self.seed_post("old-post")

@@ -101,9 +101,17 @@ class ServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "persona_id": "role",
             "scope": "session:42",
         }
-        self.bot = object()
+        self.bot = SimpleNamespace(
+            get_login_info=AsyncMock(return_value={"user_id": "99"}),
+            _wsr_api_clients={"99": object()},
+        )
         self.event = FakeEvent(self.bot)
         self.context = FakeContext()
+        self.platform = SimpleNamespace(
+            meta=lambda: SimpleNamespace(id="qq", name="aiocqhttp"),
+            get_client=lambda: self.bot,
+        )
+        self.context.platform_manager = SimpleNamespace(platform_insts=[self.platform])
         self.integrations = FakeIntegrations(self.binding, self.photo)
         self.remote_details = {}
         self.transport = SimpleNamespace(

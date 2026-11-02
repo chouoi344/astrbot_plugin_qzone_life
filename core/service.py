@@ -32,7 +32,7 @@ from .schedule_sync import LifeSnapshots
 from .sharing import build_sharing_context, choose_share_intent, selected_context
 from .settings import Settings, admin_ids
 from .store import StateStore
-from .transport import QzoneTransport
+from .transport import AccountIdentityError, QzoneTransport
 
 
 class QzoneService:
@@ -58,12 +58,14 @@ class QzoneService:
         self.event_factory = event_factory
         self._transport = None
         self._transport_client = None
+        self._transport_bot_id = None
         self._lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         self._setup_lock = asyncio.Lock()
         self._setup_retry_at = 0.0
         self._setup_error = None
         self._setup_admins = None
+        self._identity_checked_at = 0.0
         self._choices = {}
         self._background = None
         self._stop = asyncio.Event()
@@ -105,7 +107,11 @@ class QzoneService:
             )
 
     async def transport(self, event):
-        if self._transport is None or self._transport_client is not event.bot:
+        bot_id = str(event.get_self_id())
+        if (
+            self._transport is None or self._transport_client is not event.bot
+            or self._transport_bot_id != bot_id
+        ):
             if self._transport:
                 await self._transport.close()
             self._transport = self.transport_factory(
@@ -115,6 +121,7 @@ class QzoneService:
                 cookie_ttl=self.settings.cookie_ttl,
             )
             self._transport_client = event.bot
+            self._transport_bot_id = bot_id
         return self._transport
 
     async def refresh_binding(self, event=None):
@@ -145,7 +152,9 @@ class QzoneService:
         return saved
 
     async def remember_persona_transition(self, previous, current):
-        if not previous or previous.get("persona_id") == current.get("persona_id"):
+        if not previous or all(
+            previous.get(key) == current.get(key) for key in ("bot_id", "persona_id")
+        ):
             return
         try:
             life = await self.life_snapshots.get(force=True)
@@ -163,6 +172,8 @@ class QzoneService:
 
     async def binding_for(self, event):
         active = await self.refresh_binding(event)
+        if active and event.unified_msg_origin == active["umo"]:
+            return active
         expected = (active or {}).get("persona_id")
         binding = await self.integrations.resolve_binding(event, expected_persona_id=expected)
         binding.update(
@@ -191,13 +202,21 @@ class QzoneService:
                     },
                     status="needs_setup",
                 )
+        try:
+            identity = await (await self.transport(event)).identity()
+            if str(identity.get("uin")) != str(binding["bot_id"]):
+                raise AccountIdentityError("空间账号暂未一致，等待连接恢复后自动识别")
+        except AccountIdentityError:
+            self._identity_checked_at = 0.0
+            raise
         return current
 
     async def ensure_ready(self, event=None, *, required=True):
         """Bootstrap from host administrators without a chat activation step."""
         if event is not None:
             self.require_admin(event)
-            self.authorize(event, allow_unbound=True)
+            if event.get_platform_name() != "aiocqhttp" or not getattr(event, "bot", None):
+                raise RequestProblem("qq_chat_required", {"result": "空间操作需要已连接的QQ会话"})
         async with self._setup_lock:
             raw_admins = self.context.get_config().get("admins_id", [])
             configured = tuple(str(value) for value in raw_admins) if isinstance(raw_admins, (list, tuple)) else ()
@@ -205,25 +224,34 @@ class QzoneService:
                 self._setup_admins = configured
                 self._setup_retry_at = 0.0
                 self._setup_error = None
+                self._identity_checked_at = 0.0
             if self._setup_error is not None and time.monotonic() < self._setup_retry_at:
                 if required:
                     raise self._setup_error
                 return None
             try:
                 saved = self.store.get_value("binding")
-                if saved and str(saved.get("admin_id")) in admin_ids(self.context):
+                if (
+                    saved and event is None
+                    and str(saved.get("admin_id")) in admin_ids(self.context)
+                    and self._identity_checked_at
+                    and time.monotonic() - self._identity_checked_at < 60
+                ):
                     ready = await self.refresh_binding(event)
                 else:
                     automatic_event = await discover_session(
-                        self.context, self.event_factory, previous=saved, hint=event
+                        self.context, self.event_factory, previous=saved, hint=event,
+                        allow_account_refresh=True,
                     )
                     ready = await self._prepare_session(automatic_event)
+                    self._identity_checked_at = time.monotonic()
                 self.store.set_value("auto_setup_status", "空间已自动准备好，权限沿用AstrBot管理员设置")
                 self._setup_error = None
                 self._setup_retry_at = 0.0
                 self.background_recovered("setup", "QQ空间自动准备")
                 return ready
             except Exception as exc:
+                self._identity_checked_at = 0.0
                 problem = exc if isinstance(exc, RequestProblem) else RequestProblem(
                     "space_preparing",
                     {"result": "QQ连接、人格或记忆功能暂未准备好，恢复后空间会自动继续"},
@@ -241,12 +269,23 @@ class QzoneService:
 
     async def _prepare_session(self, event):
         self.require_admin(event)
-        self.authorize(event, allow_unbound=True)
+        # Only discovery calls this method. The observed login and its Cookie
+        # must agree before replacing a saved account; old task owners stay put.
+        if event.get_platform_name() != "aiocqhttp" or not getattr(event, "bot", None):
+            raise RequestProblem("qq_chat_required", {"result": "空间操作需要已连接的QQ会话"})
         if event.get_group_id():
             raise RequestProblem(
                 "private_chat_required",
                 {"result": "日常分享参考管理员与角色的QQ私聊"},
                 status="needs_setup",
+            )
+        transport = await self.transport(event)
+        identity = await transport.identity(force=True)
+        if str(identity.get("uin")) != str(event.get_self_id()):
+            raise RequestProblem(
+                "account_changed",
+                {"result": "空间登录账号与当前机器人不同，等待QQ连接恢复"},
+                status="blocked",
             )
         binding = await self.integrations.resolve_binding(event)
         binding.update(
@@ -261,20 +300,16 @@ class QzoneService:
                 {"result": "当前会话尚未选定角色，需要先在AstrBot设置中选择人设"},
                 status="needs_setup",
             )
-        transport = await self.transport(event)
-        identity = await transport.identity()
-        if str(identity.get("uin")) != binding["bot_id"]:
-            raise RequestProblem(
-                "account_changed",
-                {"result": "空间登录账号与当前机器人不同，等待QQ连接恢复"},
-                status="blocked",
-            )
         previous = self.store.get_value("binding")
         await self.remember_persona_transition(previous, binding)
         self.store.set_value("binding", binding)
         if previous and previous != binding:
             self.store.cancel_pending_plans(str(self.now().date()))
             self._choices.clear()
+        if previous and previous.get("bot_id") != binding["bot_id"]:
+            self.store.set_value("activated_at", time.time())
+            self._last_poll = 0.0
+            logger.info("QQ空间已核对当前连接并自动更新账号，历史说说和记忆保留原归属")
         if self.store.get_value("activated_at") is None:
             self.store.set_value("activated_at", time.time())
         return binding
@@ -898,7 +933,10 @@ class QzoneService:
         # Replan once for the simpler settings / interval-aware planner, and
         # again if today's maximum changes. Public writes retain their records.
         binding = self.store.get_value("binding") or {}
-        owner = json.dumps([binding.get("persona_id"), binding.get("scope")], ensure_ascii=False)
+        owner = json.dumps(
+            [binding.get("bot_id"), binding.get("persona_id"), binding.get("scope")],
+            ensure_ascii=False,
+        )
         character = hashlib.sha256(owner.encode()).hexdigest()[:12]
         return f"interval-v4:{schedule_hash(life)}:max{self.settings.daily_max}:role{character}"
 
@@ -929,7 +967,7 @@ class QzoneService:
             target = daily_target(
                 day, binding["bot_id"], self.settings.daily_min, self.settings.daily_max
             )
-            remaining = max(0, target - self.store.count_autonomous(day))
+            remaining = max(0, target - self.store.count_autonomous(day, binding["bot_id"]))
             self.store.cancel_pending_plans(day)
             scheduled = 0
             if remaining:
@@ -959,10 +997,10 @@ class QzoneService:
             "expires_at", plan["slot_at"] + 3600
         )
 
-    async def run_autonomous(self, event, binding):
+    async def run_autonomous(self, event, binding, *, binding_verified=False):
         from .autonomy import run_autonomous
 
-        return await run_autonomous(self, event, binding)
+        return await run_autonomous(self, event, binding, binding_verified=binding_verified)
 
     def background_error(self, category, label, exc):
         """One useful traceback per incident, then bounded repeated summaries."""
@@ -994,7 +1032,6 @@ class QzoneService:
             return
         async with self._lock:
             event = self.event_factory(self.context, binding)
-            binding = await self.refresh_binding(event)
             await self.process_outbox()
             if time.time() - self._last_poll >= self.settings.poll_seconds:
                 self._last_poll = time.time()
@@ -1003,9 +1040,21 @@ class QzoneService:
                     self.background_recovered("comments", "QQ空间评论检查")
                     self.store.set_value("last_comment_error", "")
                 except Exception as exc:
+                    if isinstance(exc, AccountIdentityError):
+                        self._identity_checked_at = 0.0
+                        # Skip image/model work until the next discovery has
+                        # confirmed one login and matching space credentials.
+                        self._setup_error = RequestProblem(
+                            "account_changed", {"result": "QQ连接与空间账号暂未一致，正在自动等待恢复"},
+                            status="waiting",
+                        )
+                        self._setup_retry_at = time.monotonic() + 60
+                        self.store.set_value("auto_setup_status", self._setup_error.facts["result"])
                     self.store.set_value("last_comment_error", str(exc)[:500])
                     self.background_error("comments", "QQ空间评论检查未完成", exc)
-        await self.run_autonomous(event, binding)
+                    if isinstance(exc, AccountIdentityError):
+                        return
+        await self.run_autonomous(event, binding, binding_verified=True)
         await self.process_outbox()
 
     async def loop(self):
@@ -1048,7 +1097,7 @@ class QzoneService:
             "ready": bool(self.store.get_value("binding")) and self._setup_error is None,
             "preparation": self.store.get_value("auto_setup_status", "按AstrBot管理员设置自动准备"),
             "paused": bool(self.store.get_value("paused", False)),
-            "today_shared": self.store.count_autonomous(str(self.now().date())),
+            "today_shared": self.store.count_autonomous(str(self.now().date()), str(event.get_self_id())),
             "daily_plan": f"按日程安排，今天最多{self.settings.daily_max}条；没有合适日常时少发或不发",
             "reply_to": "只回复管理员的评论",
             "manual": "按用户要求发布另计",
@@ -1277,10 +1326,10 @@ class QzoneService:
         binding = self.store.get_value("binding")
         summary = self.store.summary()
         lines = [
-            "QQ空间 v0.3.0",
+            "QQ空间 v0.3.1",
             f"参考账号与角色：{binding['bot_id'] + ' / ' + str(binding.get('persona_id')) if binding else '等待根据AstrBot管理员和QQ连接自动准备'}",
             f"后台：{'已暂停' if self.store.get_value('paused', False) else '自动准备或运行中'}",
-            f"今日自主已发：{self.store.count_autonomous(str(self.now().date()))}，每日上限 {self.settings.daily_max} 条；用户要求不计额度",
+            f"今日自主已发：{self.store.count_autonomous(str(self.now().date()), (binding or {}).get('bot_id', ''))}，每日上限 {self.settings.daily_max} 条；用户要求不计额度",
             f"任务状态：{json.dumps(summary, ensure_ascii=False)}",
         ]
         for key, label in (

@@ -142,6 +142,100 @@ class AutoSetupTests(IsolatedAsyncioTestCase):
             await self.discover(hint=self.hint(bot="88"))
         self.assertEqual(caught.exception.code, "account_changed")
 
+    async def test_refresh_uses_live_bot_and_preserves_admin_without_chat_or_mutating_previous(self):
+        previous = {"umo": "qq:FriendMessage:43", "bot_id": "88", "admin_id": "43"}
+        self.platform.get_client()._wsr_api_clients = {"99": object()}
+        result = await self.discover(previous=previous, allow_account_refresh=True)
+        self.assertEqual(result["bot_id"], "99")
+        self.assertEqual(result["admin_id"], "43")
+        self.assertEqual(result["umo"], "qq:FriendMessage:43")
+        self.assertEqual(previous["bot_id"], "88")
+        self.assertNotEqual(result["bot_id"], result["admin_id"])
+        self.context.send_message.assert_not_awaited()
+        self.context.conversation_manager.assert_not_called()
+        self.platform.get_client().send.assert_not_awaited()
+
+    async def test_refresh_stays_on_original_adapter_even_when_another_account_is_online(self):
+        other = self.make_platform("other", "88")
+        self.manager.platform_insts.append(other)
+        previous = {"umo": "qq:FriendMessage:42", "bot_id": "88", "admin_id": "42"}
+        result = await self.discover(previous=previous, allow_account_refresh=True)
+        self.assertEqual(result["bot_id"], "99")
+        other.get_client().get_login_info.assert_not_awaited()
+        self.manager.platform_insts = [other]
+        with self.assertRaises(RequestProblem) as caught:
+            await self.discover(previous=previous, allow_account_refresh=True)
+        self.assertEqual(caught.exception.code, "qq_connection_waiting")
+        other.get_client().get_login_info.assert_not_awaited()
+
+    async def test_refresh_accepts_matching_live_hint_but_rejects_stale_or_other_adapter_hint(self):
+        previous = {"umo": "qq:FriendMessage:42", "bot_id": "88", "admin_id": "42"}
+        self.assertEqual((await self.discover(
+            previous=previous, hint=self.hint(), allow_account_refresh=True
+        ))["bot_id"], "99")
+        for hint in (self.hint(bot="88"), self.hint(platform="other")):
+            with self.subTest(hint=hint.unified_msg_origin, bot=hint.get_self_id()):
+                with self.assertRaises(RequestProblem) as caught:
+                    await self.discover(previous=previous, hint=hint, allow_account_refresh=True)
+                self.assertEqual(caught.exception.code, "account_changed")
+
+    async def test_refresh_does_not_grant_non_admin_access(self):
+        previous = {"umo": "qq:FriendMessage:42", "bot_id": "88", "admin_id": "42"}
+        with self.assertRaises(PermissionError):
+            await self.discover(
+                previous=previous, hint=self.hint(sender="777"), allow_account_refresh=True
+            )
+        self.platform.get_client().get_login_info.assert_not_awaited()
+
+    async def test_refresh_waits_through_disconnect_and_then_automatically_recovers(self):
+        previous = {"umo": "qq:FriendMessage:42", "bot_id": "88", "admin_id": "42"}
+        client = self.platform.get_client()
+        client._wsr_api_clients = {}
+        with self.assertRaises(RequestProblem) as caught:
+            await self.discover(previous=previous, allow_account_refresh=True)
+        self.assertEqual(caught.exception.code, "qq_connection_waiting")
+        client.get_login_info.assert_not_awaited()
+        client._wsr_api_clients = {"99": object()}
+        self.assertEqual((await self.discover(
+            previous=previous, allow_account_refresh=True
+        ))["bot_id"], "99")
+
+    async def test_refresh_rejects_multiple_reverse_accounts(self):
+        previous = {"umo": "qq:FriendMessage:42", "bot_id": "88", "admin_id": "42"}
+        self.platform.get_client()._wsr_api_clients = {"99": object(), "88": object()}
+        with self.assertRaises(RequestProblem) as caught:
+            await self.discover(previous=previous, allow_account_refresh=True)
+        self.assertEqual(caught.exception.code, "qq_account_ambiguous")
+        self.platform.get_client().get_login_info.assert_not_awaited()
+
+    async def test_reverse_connection_identity_must_agree_with_login_response(self):
+        self.platform.get_client()._wsr_api_clients = {"88": object()}
+        with self.assertRaises(RequestProblem) as caught:
+            await self.discover(allow_account_refresh=True)
+        self.assertEqual(caught.exception.code, "account_changed")
+        self.factory.assert_not_called()
+
+    async def test_connection_change_during_login_is_rejected(self):
+        client = self.platform.get_client()
+        client._wsr_api_clients = {"99": object()}
+
+        async def change_account():
+            client._wsr_api_clients = {"88": object()}
+            return {"user_id": "88"}
+
+        client.get_login_info.side_effect = change_account
+        with self.assertRaises(RequestProblem) as caught:
+            await self.discover(allow_account_refresh=True)
+        self.assertEqual(caught.exception.code, "account_changed")
+        self.factory.assert_not_called()
+
+    async def test_invalid_reverse_identity_is_not_ignored(self):
+        self.platform.get_client()._wsr_api_clients = {"not-a-qq": object()}
+        with self.assertRaises(RequestProblem) as caught:
+            await self.discover(allow_account_refresh=True)
+        self.assertEqual(caught.exception.code, "qq_connection_waiting")
+        self.platform.get_client().get_login_info.assert_not_awaited()
+
     async def test_manager_get_insts_supported_and_login_wait_is_bounded(self):
         self.manager.get_insts = lambda: [self.platform]
 

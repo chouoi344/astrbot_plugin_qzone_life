@@ -80,25 +80,45 @@ def _platforms(context):
     return result
 
 
+def _connected_qq(client):
+    """Read the unambiguous reverse-WS identity, if exposed by the adapter."""
+    connections = getattr(client, "_wsr_api_clients", None)
+    if not isinstance(connections, dict):
+        return None
+    if not connections:
+        return ""
+    if len(connections) != 1:
+        raise _problem(
+            "qq_account_ambiguous", "同一QQ连接中有多个机器人账号，请在后台为本插件保留一个QQ账号"
+        )
+    identity = _qq(next(iter(connections)))
+    if not identity:
+        raise _problem("qq_connection_waiting", "QQ连接身份尚未就绪，恢复后会自动准备空间")
+    return identity
+
+
 async def _identity(platform):
     try:
         client = platform.get_client()
         # CQHttp's reverse-WS client map is also used by AstrBot's adapter.
         # Our transport supports one bot per adapter; never select an arbitrary
         # account when its later cookie requests cannot carry a routing id.
-        connections = getattr(client, "_wsr_api_clients", None)
-        if isinstance(connections, dict):
-            if not connections:
-                return ""
-            if len(connections) != 1:
-                raise _problem(
-                    "qq_account_ambiguous", "同一QQ连接中有多个机器人账号，请在后台为本插件保留一个QQ账号"
-                )
+        connected_before = _connected_qq(client)
+        if connected_before == "":
+            return ""
         getter = getattr(client, "get_login_info", None)
         if not callable(getter):
             return ""
         raw = await asyncio.wait_for(_await(getter()), timeout=_LOGIN_TIMEOUT)
-        return _login_id(raw)
+        connected_after = _connected_qq(client)
+        if connected_after == "":
+            return ""
+        login_id = _login_id(raw)
+        if connected_before != connected_after or (
+            connected_after is not None and login_id and connected_after != login_id
+        ):
+            raise _problem("account_changed", "QQ连接与登录账号暂未一致，恢复后会自动准备空间")
+        return login_id
     except RequestProblem:
         raise
     except Exception:
@@ -107,8 +127,14 @@ async def _identity(platform):
         return ""
 
 
-async def discover_session(context, event_factory, *, previous=None, hint=None):
-    """Return a clean administrator private event, without asking for a command."""
+async def discover_session(
+    context, event_factory, *, previous=None, hint=None, allow_account_refresh=False
+):
+    """Return an observed session; the caller still verifies its space Cookie.
+
+    Refreshing may follow the sole live account on the saved adapter. It never
+    selects another adapter or changes stored posts, sessions or permissions.
+    """
     admins = configured_admins(context)
     if not admins:
         raise _problem("admin_required", "请在AstrBot后台填写管理员QQ，保存后会自动准备空间")
@@ -117,6 +143,7 @@ async def discover_session(context, event_factory, *, previous=None, hint=None):
     if admin not in admins:
         admin = admins[0]
     platform_id = ""
+    hint_bot = ""
     expected_bot = _qq(previous.get("bot_id"))
     if previous:
         origin = str(previous.get("umo") or "").split(":", 2)
@@ -132,7 +159,10 @@ async def discover_session(context, event_factory, *, previous=None, hint=None):
         hint_bot = _qq(hint.get_self_id())
         if len(hint_origin) != 3 or not hint_origin[0] or not hint_bot:
             raise _problem("qq_connection_waiting", "QQ会话信息尚未就绪，会在连接恢复后自动准备")
-        if previous and (hint_origin[0] != platform_id or hint_bot != expected_bot):
+        if previous and (
+            hint_origin[0] != platform_id
+            or (hint_bot != expected_bot and not allow_account_refresh)
+        ):
             raise _problem("account_changed", "当前QQ账号与原空间账号不同，已暂停空间操作")
         platform_id = platform_id or hint_origin[0]
         expected_bot = expected_bot or hint_bot
@@ -155,7 +185,9 @@ async def discover_session(context, event_factory, *, previous=None, hint=None):
     if len(candidates) != 1:
         raise _problem("qq_account_ambiguous", "当前有多个可用QQ连接，请在后台为本插件保留一个QQ连接")
     selected, bot_id = candidates[0]
-    if expected_bot and bot_id != expected_bot:
+    if hint_bot and bot_id != hint_bot:
+        raise _problem("account_changed", "当前消息与QQ登录账号不同，已暂停此次空间操作")
+    if expected_bot and bot_id != expected_bot and not allow_account_refresh:
         raise _problem("account_changed", "QQ连接账号已改变，已暂停原空间操作")
     event = await _await(event_factory(context, {
         "umo": f"{selected}:FriendMessage:{admin}", "bot_id": bot_id,

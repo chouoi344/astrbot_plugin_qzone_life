@@ -13,7 +13,7 @@ import inspect
 import os
 import re
 import time
-from http.cookies import SimpleCookie
+from http.cookies import CookieError, SimpleCookie
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -30,6 +30,10 @@ from ..vendor.qzone_protocol import (
 
 class QzoneReadError(RuntimeError):
     """The remote read did not establish a trustworthy result."""
+
+
+class AccountIdentityError(ValueError):
+    """The selected connection and its space credentials are not one identity."""
 
 
 class _CredentialsUnavailable(RuntimeError):
@@ -61,55 +65,133 @@ class QzoneTransport:
         self.cookie_ttl = max(0, int(cookie_ttl))
         self._credentials: Credentials | None = None
         self._refreshed_at = 0.0
+        self._connection_snapshot = None
+        self._nickname = value
         self._credential_lock = asyncio.Lock()
         self._http: Any = None
 
-    async def _get_context(self) -> Credentials:
-        async with self._credential_lock:
-            if self._credentials is not None and (
-                not self.cookie_ttl or time.monotonic() - self._refreshed_at < self.cookie_ttl
-            ):
-                return self._credentials
-            if self.client is None:
-                raise ValueError("没有可用的 QQ 连接")
-            response = await self.client.get_cookies(domain="user.qzone.qq.com")
-            if isinstance(response, dict) and isinstance(response.get("data"), dict):
-                response = response["data"]
-            cookie_text = response.get("cookies") if isinstance(response, dict) else None
-            if not isinstance(cookie_text, str) or not cookie_text.strip():
-                raise ValueError("QQ 连接未提供空间登录凭证")
-            try:
-                cookies = {key: morsel.value for key, morsel in SimpleCookie(cookie_text).items()}
-                uin_text = cookies.get("uin", "").removeprefix("o").removeprefix("O")
-                uin = int(uin_text)
-            except (ValueError, TypeError):
-                raise ValueError("空间登录凭证中的 QQ 号无效") from None
-            if uin != self.expected_uin:
-                raise ValueError("登录 QQ 与配置的机器人 QQ 不一致，已停止空间操作")
-            skey = cookies.get("skey", "")
-            p_skey = cookies.get("p_skey", "") or skey
-            if not p_skey:
-                raise ValueError("空间登录凭证缺少必要字段")
-            self._credentials = Credentials(uin, skey, p_skey)
-            self._refreshed_at = time.monotonic()
-            return self._credentials
+    @staticmethod
+    def _account_id(value: Any) -> int:
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            return 0
+        text = str(value).strip()
+        return int(text) if len(text) <= 20 and text.isascii() and text.isdigit() and int(text) > 0 else 0
 
-    async def identity(self) -> dict[str, Any]:
-        context = await self._get_context()
-        nickname = str(context.uin)
+    def _connection_state(self):
+        """Observe reconnects without selecting an arbitrary reverse-WS account."""
+        if self.client is None:
+            raise AccountIdentityError("没有可用的 QQ 连接")
+        connections = getattr(self.client, "_wsr_api_clients", None)
+        if isinstance(connections, dict):
+            if not connections:
+                raise AccountIdentityError("QQ 连接已断开，等待自动恢复")
+            if len(connections) != 1:
+                raise AccountIdentityError("同一 QQ 连接中有多个账号，空间操作等待账号明确")
+            account, connection = next(iter(connections.items()))
+            if self._account_id(account) != self.expected_uin:
+                raise AccountIdentityError("QQ 连接账号已变化，已停止原账号的空间操作")
+            return (str(account), id(connection))
+        return None
+
+    @staticmethod
+    def _response_data(response: Any) -> dict[str, Any]:
+        if not isinstance(response, dict):
+            raise AccountIdentityError("QQ 连接返回的账号信息无效，等待自动恢复")
+        if "status" in response and response["status"] != "ok":
+            raise AccountIdentityError("QQ 连接尚未提供有效登录状态，等待自动恢复")
+        code = response.get("retcode", 0)
+        if isinstance(code, bool) or code not in (0, "0"):
+            raise AccountIdentityError("QQ 连接尚未提供有效登录状态，等待自动恢复")
+        data = response.get("data", response)
+        if not isinstance(data, dict):
+            raise AccountIdentityError("QQ 连接返回的账号信息无效，等待自动恢复")
+        return data
+
+    async def _login_identity(self) -> dict[str, Any]:
         getter = getattr(self.client, "get_login_info", None)
-        if getter is not None:
+        if not callable(getter):
+            raise AccountIdentityError("QQ 连接尚未提供账号查询，等待自动恢复")
+        try:
             result = getter()
-            info = await result if inspect.isawaitable(result) else result
-            if isinstance(info, dict) and isinstance(info.get("data"), dict):
-                info = info["data"]
-            if isinstance(info, dict):
-                reported = number(info.get("user_id", info.get("uin")))
-                if reported and reported != self.expected_uin:
-                    self._credentials = None
-                    raise ValueError("QQ 连接账号已变化，已停止空间操作")
-                nickname = str(info.get("nickname") or nickname)
-        return {"uin": context.uin, "nickname": nickname}
+            if inspect.isawaitable(result):
+                result = await asyncio.wait_for(result, timeout=min(self.timeout, 8))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # SDK exceptions can contain credentials and endpoint URLs.
+            raise AccountIdentityError("暂时无法核对 QQ 登录账号，等待自动恢复") from None
+        info = self._response_data(result)
+        accounts = [self._account_id(info[key]) for key in ("user_id", "uin", "self_id") if key in info]
+        if not accounts or not all(accounts) or len(set(accounts)) != 1:
+            raise AccountIdentityError("QQ 连接返回的账号信息无效或冲突，等待自动恢复")
+        if accounts[0] != self.expected_uin:
+            raise AccountIdentityError("QQ 连接账号已变化，已停止原账号的空间操作")
+        return info
+
+    def _clear_credentials(self):
+        self._credentials = None
+        self._refreshed_at = 0.0
+        self._connection_snapshot = None
+
+    async def _get_context(self, *, force=False, verify_login=False) -> Credentials:
+        async with self._credential_lock:
+            try:
+                connection = self._connection_state()
+                cached = self._credentials is not None and connection == self._connection_snapshot and (
+                    not self.cookie_ttl or time.monotonic() - self._refreshed_at < self.cookie_ttl
+                )
+                if cached and not force:
+                    if verify_login:
+                        info = await self._login_identity()
+                        if self._connection_state() != connection:
+                            raise AccountIdentityError("QQ 连接正在重连，等待重新核对空间账号")
+                        self._nickname = str(info.get("nickname") or self.expected_uin)
+                    return self._credentials
+                self._clear_credentials()
+                await self._login_identity()
+                try:
+                    response = await asyncio.wait_for(
+                        self.client.get_cookies(domain="user.qzone.qq.com"),
+                        timeout=min(self.timeout, 8),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    raise AccountIdentityError("暂时无法取得空间登录凭据，等待自动恢复") from None
+                cookie_text = self._response_data(response).get("cookies")
+                if not isinstance(cookie_text, str) or not cookie_text.strip():
+                    raise AccountIdentityError("QQ 连接未提供空间登录凭据")
+                try:
+                    cookies = {key: morsel.value for key, morsel in SimpleCookie(cookie_text).items()}
+                    uin_text = cookies.get("uin", "").removeprefix("o").removeprefix("O")
+                    uin = self._account_id(uin_text)
+                except (CookieError, ValueError, TypeError):
+                    raise AccountIdentityError("空间登录凭据中的 QQ 号无效") from None
+                if not uin:
+                    raise AccountIdentityError("空间登录凭据中的 QQ 号无效")
+                if uin != self.expected_uin:
+                    raise AccountIdentityError("空间登录凭据与当前机器人 QQ 不一致，等待自动恢复")
+                skey = cookies.get("skey", "")
+                p_skey = cookies.get("p_skey", "") or skey
+                if not p_skey:
+                    raise AccountIdentityError("空间登录凭据缺少必要字段")
+                # Both reads belong to one still-connected account. Do not keep
+                # a valid-looking Cookie if the login changed during its RPC.
+                info = await self._login_identity()
+                if self._connection_state() != connection:
+                    raise AccountIdentityError("QQ 连接正在重连，等待重新核对空间账号")
+                self._credentials = Credentials(uin, skey, p_skey)
+                self._connection_snapshot = connection
+                self._nickname = str(info.get("nickname") or self.expected_uin)
+                self._refreshed_at = time.monotonic()
+                return self._credentials
+            except BaseException:
+                self._clear_credentials()
+                raise
+
+    async def identity(self, *, force: bool = False) -> dict[str, Any]:
+        context = await self._get_context(force=force, verify_login=True)
+        return {"uin": context.uin, "nickname": self._nickname}
 
     async def _request_context(self) -> Credentials:
         try:
