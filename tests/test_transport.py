@@ -23,6 +23,9 @@ class FakeQQ:
     async def get_cookies(self, domain):
         return {"cookies": f"uin=o{self.uin}; skey=test_skey; p_skey=test_p_skey"}
 
+    async def get_status(self):
+        return {"online": True, "good": True}
+
     async def get_login_info(self):
         return {"user_id": self.uin, "nickname": "测试角色"}
 
@@ -115,6 +118,8 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         ])
         with self.assertRaises(AccountIdentityError):
             await self.transport.identity(force=True)
+        # A corrected credential is retried only after the account cooldown.
+        self.transport.policy._clock = lambda: self.transport.policy.retry_at + 1
         self.assertEqual((await self.transport.identity(force=True))["uin"], 10001)
         self.assertEqual(self.transport._credentials.p_skey, "recovered")
         self.transport._request.assert_not_awaited()
@@ -288,22 +293,30 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 self.transport._request.assert_awaited_once()
 
     async def test_upload_can_finish_but_failed_final_check_prevents_publish_post(self):
-        self.transport._request.return_value = upload_response()
+        async def request(*args, **kwargs):
+            await self.transport._before_write(kwargs.get("before_write"))
+            return upload_response()
+
+        self.transport._request.side_effect = request
         check = AsyncMock(side_effect=RuntimeError("expired secret details"))
         result = await self.transport.publish("post", [b"image"], before_publish=check)
         self.assertEqual((result["status"], result["stage"]), ("rejected", "preflight"))
         self.assertNotIn("secret", str(result))
         check.assert_awaited_once()
-        self.transport._request.assert_awaited_once()
-        self.assertEqual(self.transport._request.await_args.args[1], self.transport.UPLOAD_URL)
+        self.assertEqual(self.transport._request.await_count, 2)
+        self.assertEqual(self.transport._request.await_args_list[0].args[1], self.transport.UPLOAD_URL)
 
     async def test_final_check_cancellation_propagates_without_publish_post(self):
-        self.transport._request.return_value = upload_response()
+        async def request(*args, **kwargs):
+            await self.transport._before_write(kwargs.get("before_write"))
+            return upload_response()
+
+        self.transport._request.side_effect = request
         check = AsyncMock(side_effect=asyncio.CancelledError())
         with self.assertRaises(asyncio.CancelledError):
             await self.transport.publish("post", [b"image"], before_publish=check)
-        self.transport._request.assert_awaited_once()
-        self.assertEqual(self.transport._request.await_args.args[1], self.transport.UPLOAD_URL)
+        self.assertEqual(self.transport._request.await_count, 2)
+        self.assertEqual(self.transport._request.await_args_list[0].args[1], self.transport.UPLOAD_URL)
 
     async def test_success_without_tid_is_unknown(self):
         self.transport._request.return_value = {"code": 0, "now": 12345}

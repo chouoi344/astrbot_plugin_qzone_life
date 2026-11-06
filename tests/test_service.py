@@ -103,6 +103,7 @@ class ServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
         }
         self.bot = SimpleNamespace(
             get_login_info=AsyncMock(return_value={"user_id": "99"}),
+            get_status=AsyncMock(return_value={"online": True}),
             _wsr_api_clients={"99": object()},
         )
         self.event = FakeEvent(self.bot)
@@ -119,10 +120,10 @@ class ServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
             publish=AsyncMock(return_value=self.result(tid="sent-post")),
             list_posts=AsyncMock(return_value=[]),
             get_post=AsyncMock(side_effect=self.remote_post),
-            delete=AsyncMock(side_effect=lambda tid: self.result(tid=tid)),
-            like=AsyncMock(side_effect=lambda tid: self.result(tid=tid)),
+            delete=AsyncMock(side_effect=lambda tid, **kwargs: self.result(tid=tid)),
+            like=AsyncMock(side_effect=lambda tid, **kwargs: self.result(tid=tid)),
             reply=AsyncMock(
-                side_effect=lambda tid, comment, text: self.result(tid=tid, reply_id="reply-1")
+                side_effect=lambda tid, comment, text, **kwargs: self.result(tid=tid, reply_id="reply-1")
             ),
             close=AsyncMock(),
         )
@@ -278,14 +279,21 @@ class ServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
             self.transport.publish.await_args.args, ("用户指定文案", [str(self.photo)])
         )
         self.assertTrue(callable(self.transport.publish.await_args.kwargs["before_publish"]))
-        self.transport.like.assert_awaited_once_with("sent-post")
+        # Publication is already durable; follow-up work runs on the worker.
+        await self.service.process_outbox()
+        self.transport.like.assert_awaited_once()
+        self.assertEqual(self.transport.like.await_args.args, ("sent-post",))
+        self.assertTrue(callable(self.transport.like.await_args.kwargs["before_write"]))
         self.assertEqual(self.integrations.sync_memory.await_args.args[1]["kind"], "publish")
 
     async def test_zero_autonomous_limit_preserves_manual_self_like_and_admin_replies(self):
         self.service.settings.daily_min = self.service.settings.daily_max = 0
         await self.service.publish_from_chat(self.event, "用户指定文案")
         self.transport.publish.assert_awaited_once()
-        self.transport.like.assert_awaited_once_with("sent-post")
+        await self.service.process_outbox()
+        self.transport.like.assert_awaited_once()
+        self.assertEqual(self.transport.like.await_args.args, ("sent-post",))
+        self.assertTrue(callable(self.transport.like.await_args.kwargs["before_write"]))
         self.seed_post("comment-post")
         self.remote_details["comment-post"]["comments"] = [self.comment()]
         await self.service.poll_comments(self.event, self.binding)
@@ -333,7 +341,9 @@ class ServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.seed_post("latest", seconds_ago=60)
         await self.service.delete_post(self.event, "刚才那条")
         await self.service.delete_post(self.event, "刚才那条")
-        self.transport.delete.assert_awaited_once_with("latest")
+        self.transport.delete.assert_awaited_once()
+        self.assertEqual(self.transport.delete.await_args.args, ("latest",))
+        self.assertTrue(callable(self.transport.delete.await_args.kwargs["before_write"]))
         self.assertEqual(self.store.get_post("latest")["status"], "deleted")
         self.assertEqual(self.store.get_post("older")["status"], "published")
 
@@ -672,7 +682,9 @@ class ServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
         response = await self.service.list_posts(self.event)
         self.assertNotIn("newer", str(response.facts))
         await self.service.delete_post(self.event, "第二条")
-        self.transport.delete.assert_awaited_once_with("older")
+        self.transport.delete.assert_awaited_once()
+        self.assertEqual(self.transport.delete.await_args.args, ("older",))
+        self.assertTrue(callable(self.transport.delete.await_args.kwargs["before_write"]))
 
     async def test_pause_control_is_immediate_while_background_work_holds_lock(self):
         async with self.service._lock:

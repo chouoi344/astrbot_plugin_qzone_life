@@ -216,8 +216,11 @@ class PersonaFollowTests(unittest.IsolatedAsyncioTestCase):
         await self.service.delete_post(self.event, "historical")
         # The deletion event follows the publication memory in the durable outbox.
         await self.service.process_outbox()
+        await self.service.process_outbox()
 
-        self.transport.delete.assert_awaited_once_with("historical")
+        self.transport.delete.assert_awaited_once()
+        self.assertEqual(self.transport.delete.await_args.args, ("historical",))
+        self.assertTrue(callable(self.transport.delete.await_args.kwargs["before_write"]))
         current = self.store.get_value("binding")
         self.assertEqual(current["persona_id"], "new-role")
         post = self.store.get_post("historical")

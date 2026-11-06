@@ -45,7 +45,7 @@ class AutoSetupWorkflowTests(IsolatedAsyncioTestCase):
             self.assertEqual(await self.service.ensure_ready(), self.binding)
             self.assertEqual(await self.service.ensure_ready(), self.binding)
         discover.assert_awaited_once()
-        self.transport.identity.assert_awaited_once_with(force=True)
+        self.transport.identity.assert_awaited_once_with()
 
     async def test_admin_removal_adopts_current_admin_and_preserves_historical_ownership(self):
         self.seed_post("old-post")
