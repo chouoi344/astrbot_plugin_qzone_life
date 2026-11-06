@@ -62,6 +62,9 @@ class IdentityRecoveryTests(IsolatedAsyncioTestCase):
         self.service.run_autonomous.assert_not_awaited()
         self.bot.get_cookies.return_value = {"cookies": "uin=o100; p_skey=fake-key"}
         clock.monotonic = lambda: 161
+        policy = self.service.request_policy("100")
+        recovered_at = policy.retry_at + 1
+        policy._clock = lambda: recovered_at
         with patch.object(fixtures.service_module, "time", clock):
             await self.service.tick()
         self.assertEqual(self.store.get_value("binding")["bot_id"], "100")

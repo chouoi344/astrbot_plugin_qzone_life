@@ -88,6 +88,45 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual((plan["status"], plan["attempt_count"]), ("skipped", 3))
         self.assertIsNone(plan["next_attempt_at"])
 
+    def test_access_wait_refunds_only_current_claim_and_survives_restart(self):
+        first = time.time()
+        self.plan(expires_at=first + 3600)
+        self.store.claim_plan("retry", now=first, retry_delays=[600, 600])
+        self.store.schedule_plan_retry("retry", "selfie_failed", now=first)
+        self.store.claim_plan("retry", now=first + 600, retry_delays=[600, 600])
+        self.store.update_plan("retry", cached_image_path="/cached.png", cached_caption="照片文案")
+        plan = self.store.defer_plan("retry", retry_at=first + 660, now=first + 600)
+        self.assertEqual((plan["status"], plan["attempt_count"]), ("pending", 1))
+        self.assertEqual(plan["cached_image_path"], "/cached.png")
+        self.assertEqual(plan["cached_caption"], "照片文案")
+        # A repeated deferral does not refund the genuine earlier failure.
+        self.assertEqual(self.store.defer_plan("retry", retry_at=first + 660, now=first + 600), plan)
+        self.store.close()
+        self.store = StateStore(self.path)
+        self.store.recover_interrupted()
+        self.assertEqual(self.store.get_plan("retry"), plan)
+        self.assertFalse(self.store.claim_plan("retry", now=first + 659, retry_delays=[600, 600]))
+        self.assertTrue(self.store.claim_plan("retry", now=first + 660, retry_delays=[600, 600]))
+        self.assertEqual(self.store.get_plan("retry")["attempt_count"], 2)
+
+    def test_access_wait_cannot_replay_inflight_publication(self):
+        first = time.time()
+        self.plan()
+        self.store.claim_plan("retry", now=first, retry_delays=[600, 600])
+        self.store.begin_operation("auto:retry", "publish", {"post": self.post()})
+        plan = self.store.defer_plan("retry", retry_at=first + 60, now=first)
+        self.assertEqual(plan["status"], "uncertain")
+        self.assertEqual(plan["attempt_count"], 1)
+
+    def test_access_wait_beyond_opportunity_skips_without_spending_attempt(self):
+        first = time.time()
+        self.plan(expires_at=first + 60)
+        self.store.claim_plan("retry", now=first, retry_delays=[600, 600])
+        plan = self.store.defer_plan("retry", retry_at=first + 60, now=first)
+        self.assertEqual((plan["status"], plan["attempt_count"]), ("skipped", 0))
+        self.assertEqual(plan["last_error_kind"], "opportunity_expired")
+        self.assertIsNone(plan["next_attempt_at"])
+
     def test_legacy_running_retry_adopts_ten_minutes_without_resetting_attempts(self):
         first = time.time()
         self.plan(status="running", retry_version=1, attempt_count=2,
@@ -367,7 +406,7 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(1792800300.0, deletion["payload"]["occurred_at"])
         self.assertEqual(self.binding, deletion["payload"]["binding"])
 
-    def test_interrupted_memory_needs_reconciliation_and_like_is_safe_to_retry(self):
+    def test_interrupted_memory_reconciles_and_like_is_not_replayed(self):
         self.publish()
         tasks = self.store.due_outbox()
         for task in tasks:
@@ -379,7 +418,40 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(1, recovered["memory"])
         self.assertEqual(1, recovered["self_like"])
         statuses = {task["kind"]: task["status"] for task in self.store.due_outbox()}
-        self.assertEqual({"memory": "reconcile", "self_like": "pending"}, statuses)
+        self.assertEqual({"memory": "reconcile"}, statuses)
+        self.assertEqual(self.store.get_outbox("qzone:99:tid-1:self_like")["status"], "uncertain")
+
+    def test_owner_filters_apply_before_post_and_comment_limits(self):
+        for index, (tid, bot_id, role) in enumerate((
+            ("current", "99", "role"),
+            ("other-bot", "100", "role"),
+            ("other-role", "99", "retired"),
+        )):
+            post = self.post(tid)
+            post["binding"] = {**self.binding, "bot_id": bot_id, "persona_id": role}
+            post["published_at"] += index * 60
+            self.store.track_post(post)
+            comment = self.comment()
+            comment.update(key="comment:" + tid, tid=tid, binding=post["binding"])
+            comment["created_at"] += index * 60
+            self.store.record_comment(comment)
+        posts = self.store.list_posts(limit=1, bot_id="99", persona_id="role")
+        comments = self.store.list_comments(limit=1, bot_id="99", persona_id="role")
+        self.assertEqual([post["tid"] for post in posts], ["current"])
+        self.assertEqual([comment["tid"] for comment in comments], ["current"])
+        self.assertEqual(self.store.list_posts(limit=1)[0]["tid"], "other-role")
+
+    def test_deferred_like_refund_does_not_revive_uncertainty(self):
+        self.publish()
+        key = "qzone:99:tid-1:self_like"
+        self.assertTrue(self.store.claim_outbox(key))
+        self.store.defer_outbox(key, "not sent", 0, refund_attempt=True)
+        self.assertEqual(self.store.get_outbox(key)["attempts"], 0)
+        self.assertTrue(self.store.claim_outbox(key))
+        self.store.stop_outbox(key, "unknown", uncertain=True)
+        self.store.defer_outbox(key, "must not refund unknown writes", 0, refund_attempt=True)
+        task = self.store.get_outbox(key)
+        self.assertEqual((task["status"], task["attempts"]), ("uncertain", 1))
 
     def test_daily_plan_survives_restart_and_schedule_changes_only_cancel_pending(self):
         base = {

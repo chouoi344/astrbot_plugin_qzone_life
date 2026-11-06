@@ -8,6 +8,8 @@ from pathlib import Path
 from .caption import single_sentence
 from .events import SilentGenerationEvent
 from .planning import daily_target, schedule_hash
+from .request_policy import QzoneDeferred
+from .transport import AccountUnavailableError
 
 
 class _StopOpportunity(RuntimeError):
@@ -58,6 +60,8 @@ async def _check(service, event, binding, plan):
         await service.verify_binding(event, binding)
         await service.integrations.check_life_persona(binding)
     except asyncio.CancelledError:
+        raise
+    except (QzoneDeferred, AccountUnavailableError):
         raise
     except Exception:
         raise _StopOpportunity("binding_changed") from None
@@ -254,6 +258,12 @@ async def run_autonomous(service, event, binding, *, binding_verified=False):
                 )
         except _StopOpportunity as exc:
             _terminal(service, plan, "cancelled", str(exc))
+        except (QzoneDeferred, AccountUnavailableError) as exc:
+            now = service.now().timestamp()
+            retry_at = max(now + 60, exc.retry_at if isinstance(exc, QzoneDeferred) else 0)
+            service.store.defer_plan(plan["plan_id"], retry_at=retry_at, now=now)
+            service.store.set_value("last_autonomous_result", "本次自主分享等待空间访问恢复")
+            raise
         except asyncio.CancelledError:
             operation = service.store.get_operation(key)
             if operation and operation["status"] in ("inflight", "uncertain"):

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+from .request_policy import QzoneDeferred
+
 
 class Outcome(str):
     """Internal diagnostics remain available without becoming chat responses."""
@@ -46,6 +48,11 @@ def exception_outcome(exc, *, action="request"):
     if isinstance(exc, RequestProblem):
         return Outcome(
             exc.code, action=action, status=exc.status, facts={"reason": exc.code, **exc.facts}
+        )
+    if isinstance(exc, QzoneDeferred):
+        return Outcome(
+            "space_waiting", action=action, status="waiting",
+            facts={"result": "空间暂时需要等待，当前操作尚未发送；稍后可再试"},
         )
     if isinstance(exc, PermissionError):
         reason, fact, status = (

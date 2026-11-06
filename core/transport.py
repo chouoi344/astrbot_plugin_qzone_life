@@ -12,11 +12,14 @@ import base64
 import inspect
 import os
 import re
+import tempfile
 import time
 from http.cookies import CookieError, SimpleCookie
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
+
+from .request_policy import QzoneDeferred, RequestPolicy
 
 from ..vendor.qzone_protocol import (
     Credentials,
@@ -32,12 +35,24 @@ class QzoneReadError(RuntimeError):
     """The remote read did not establish a trustworthy result."""
 
 
+class QzonePostDeletedError(QzoneReadError):
+    """The detail endpoint explicitly says this post has already been deleted."""
+
+
 class AccountIdentityError(ValueError):
     """The selected connection and its space credentials are not one identity."""
 
 
+class AccountUnavailableError(AccountIdentityError):
+    """The current login cannot be checked yet; no different account was proven."""
+
+
 class _CredentialsUnavailable(RuntimeError):
     """Credential acquisition failed before an HTTP request could be sent."""
+
+
+class _PreflightRejected(RuntimeError):
+    """The role, permission, or opportunity changed before the HTTP write."""
 
 
 class QzoneTransport:
@@ -54,7 +69,8 @@ class QzoneTransport:
     MAX_IMAGE_BYTES = 20 * 1024 * 1024
 
     def __init__(
-        self, client: Any, expected_uin: int | str, timeout: int = 30, cookie_ttl: int = 1800
+        self, client: Any, expected_uin: int | str, timeout: int = 30, cookie_ttl: int = 1800,
+        *, policy: RequestPolicy | None = None, staging_dir: str | Path | None = None,
     ):
         value = str(expected_uin).strip()
         if not value.isdigit() or int(value) <= 0:
@@ -69,6 +85,8 @@ class QzoneTransport:
         self._nickname = value
         self._credential_lock = asyncio.Lock()
         self._http: Any = None
+        self.policy = policy or RequestPolicy(account=value)
+        self.staging_dir = Path(staging_dir) if staging_dir is not None else None
 
     @staticmethod
     def _account_id(value: Any) -> int:
@@ -80,11 +98,11 @@ class QzoneTransport:
     def _connection_state(self):
         """Observe reconnects without selecting an arbitrary reverse-WS account."""
         if self.client is None:
-            raise AccountIdentityError("没有可用的 QQ 连接")
+            raise AccountUnavailableError("没有可用的 QQ 连接")
         connections = getattr(self.client, "_wsr_api_clients", None)
         if isinstance(connections, dict):
             if not connections:
-                raise AccountIdentityError("QQ 连接已断开，等待自动恢复")
+                raise AccountUnavailableError("QQ 连接已断开，等待自动恢复")
             if len(connections) != 1:
                 raise AccountIdentityError("同一 QQ 连接中有多个账号，空间操作等待账号明确")
             account, connection = next(iter(connections.items()))
@@ -107,11 +125,31 @@ class QzoneTransport:
             raise AccountIdentityError("QQ 连接返回的账号信息无效，等待自动恢复")
         return data
 
+    async def _online(self):
+        """The websocket may remain connected after QQ itself has logged out."""
+        getter = getattr(self.client, "get_status", None)
+        if not callable(getter):
+            raise AccountUnavailableError("暂时无法核对 QQ 在线状态，等待自动恢复")
+        try:
+            self.policy.count("online_checks")
+            result = getter()
+            if inspect.isawaitable(result):
+                result = await asyncio.wait_for(result, timeout=min(self.timeout, 8))
+            data = self._response_data(result)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise AccountUnavailableError("暂时无法核对 QQ 在线状态，等待自动恢复") from None
+        if data.get("online") is not True:
+            raise AccountUnavailableError("QQ 尚未在线，空间操作等待登录恢复")
+
     async def _login_identity(self) -> dict[str, Any]:
+        await self._online()
         getter = getattr(self.client, "get_login_info", None)
         if not callable(getter):
-            raise AccountIdentityError("QQ 连接尚未提供账号查询，等待自动恢复")
+            raise AccountUnavailableError("QQ 连接尚未提供账号查询，等待自动恢复")
         try:
+            self.policy.count("login_checks")
             result = getter()
             if inspect.isawaitable(result):
                 result = await asyncio.wait_for(result, timeout=min(self.timeout, 8))
@@ -119,7 +157,7 @@ class QzoneTransport:
             raise
         except Exception:
             # SDK exceptions can contain credentials and endpoint URLs.
-            raise AccountIdentityError("暂时无法核对 QQ 登录账号，等待自动恢复") from None
+            raise AccountUnavailableError("暂时无法核对 QQ 登录账号，等待自动恢复") from None
         info = self._response_data(result)
         accounts = [self._account_id(info[key]) for key in ("user_id", "uin", "self_id") if key in info]
         if not accounts or not all(accounts) or len(set(accounts)) != 1:
@@ -133,23 +171,32 @@ class QzoneTransport:
         self._refreshed_at = 0.0
         self._connection_snapshot = None
 
-    async def _get_context(self, *, force=False, verify_login=False) -> Credentials:
+    async def _get_context(self, *, force=False, verify_login=False, allow_expired=False) -> Credentials:
         async with self._credential_lock:
+            attempted_refresh = False
             try:
                 connection = self._connection_state()
+                if self._credentials is not None and connection != self._connection_snapshot:
+                    self._clear_credentials()
+                self.policy.check()
                 cached = self._credentials is not None and connection == self._connection_snapshot and (
-                    not self.cookie_ttl or time.monotonic() - self._refreshed_at < self.cookie_ttl
+                    allow_expired or not self.cookie_ttl
+                    or time.monotonic() - self._refreshed_at < self.cookie_ttl
                 )
                 if cached and not force:
                     if verify_login:
                         info = await self._login_identity()
                         if self._connection_state() != connection:
-                            raise AccountIdentityError("QQ 连接正在重连，等待重新核对空间账号")
+                            raise AccountUnavailableError("QQ 连接正在重连，等待重新核对空间账号")
                         self._nickname = str(info.get("nickname") or self.expected_uin)
+                    else:
+                        await self._online()
                     return self._credentials
                 self._clear_credentials()
                 await self._login_identity()
                 try:
+                    attempted_refresh = True
+                    self.policy.count("credential_refreshes")
                     response = await asyncio.wait_for(
                         self.client.get_cookies(domain="user.qzone.qq.com"),
                         timeout=min(self.timeout, 8),
@@ -157,7 +204,7 @@ class QzoneTransport:
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    raise AccountIdentityError("暂时无法取得空间登录凭据，等待自动恢复") from None
+                    raise AccountUnavailableError("暂时无法取得空间登录凭据，等待自动恢复") from None
                 cookie_text = self._response_data(response).get("cookies")
                 if not isinstance(cookie_text, str) or not cookie_text.strip():
                     raise AccountIdentityError("QQ 连接未提供空间登录凭据")
@@ -179,32 +226,50 @@ class QzoneTransport:
                 # a valid-looking Cookie if the login changed during its RPC.
                 info = await self._login_identity()
                 if self._connection_state() != connection:
-                    raise AccountIdentityError("QQ 连接正在重连，等待重新核对空间账号")
+                    raise AccountUnavailableError("QQ 连接正在重连，等待重新核对空间账号")
                 self._credentials = Credentials(uin, skey, p_skey)
                 self._connection_snapshot = connection
                 self._nickname = str(info.get("nickname") or self.expected_uin)
                 self._refreshed_at = time.monotonic()
                 return self._credentials
-            except BaseException:
+            except QzoneDeferred:
+                # A network/service cooldown says nothing about a healthy
+                # Cookie. Keep it for the next task; TTL and connection checks
+                # still run before it can be used again.
+                raise
+            except BaseException as exc:
+                if attempted_refresh and not isinstance(exc, asyncio.CancelledError):
+                    self.policy.failure("credentials")
                 self._clear_credentials()
                 raise
 
     async def identity(self, *, force: bool = False) -> dict[str, Any]:
-        context = await self._get_context(force=force, verify_login=True)
+        # An idle identity check uses the already verified account association.
+        # TTL renewal belongs to an actual space operation, not the ready loop.
+        context = await self._get_context(force=force, verify_login=True, allow_expired=True)
         return {"uin": context.uin, "nickname": self._nickname}
 
     async def _request_context(self) -> Credentials:
         try:
-            return await self._get_context()
+            return await self._get_context(verify_login=True)
         except asyncio.CancelledError:
+            raise
+        except (QzoneDeferred, AccountIdentityError):
             raise
         except Exception:
             raise _CredentialsUnavailable() from None
 
-    def _credential_rejection(self, tid: str = "") -> dict[str, Any]:
+    def _credential_rejection(self, tid: str = "", *, temporary=True) -> dict[str, Any]:
         return self._result(
             "rejected", tid=tid,
             message="暂时无法取得空间登录状态，本次操作尚未发送", stage="credentials",
+            retryable=temporary, blocked=True, retry_at=self.policy.retry_at, access_wait=temporary,
+        )
+
+    def _deferred_rejection(self, exc, tid=""):
+        return self._result(
+            "rejected", tid=tid, message="空间访问正在等待恢复，本次操作尚未发送",
+            stage="cooldown", retryable=True, blocked=True, retry_at=exc.retry_at, access_wait=True,
         )
 
     async def _http_session(self) -> Any:
@@ -219,34 +284,79 @@ class QzoneTransport:
         return self._http
 
     async def _request(
-        self, method: str, url: str, *, params=None, data=None, timeout=None
+        self, method: str, url: str, *, params=None, data=None, timeout=None, context=None,
+        before_write=None,
     ) -> dict[str, Any]:
         import aiohttp
 
-        context = await self._request_context()
-        client = await self._http_session()
-        async with client.request(
-            method,
-            url,
-            params=params,
-            data=data,
-            headers=context.headers(),
-            cookies=context.cookies(),
-            allow_redirects=False,
-            timeout=aiohttp.ClientTimeout(total=timeout or self.timeout),
-        ) as response:
-            body = await response.text()
-            raw = parse_response(body)
-            raw["_http_status"] = response.status
-        # Refresh credentials on the NEXT task; never replay this write.
+        async with self.policy.lock:
+            await self.policy.wait_turn(write=method != "GET")
+            if method != "GET":
+                await self._before_write(before_write)
+            current = await self._request_context()
+            if context is not None and context != current:
+                # Query/body tokens were built from context. Never mix them with
+                # a newly acquired Cookie, or keep uploading after reconnect.
+                raise _CredentialsUnavailable()
+            context = current
+            client = await self._http_session()
+            try:
+                self.policy.sent(write=method != "GET")
+                async with client.request(
+                    method, url, params=params, data=data,
+                    headers=context.headers(), cookies=context.cookies(),
+                    allow_redirects=False,
+                    timeout=aiohttp.ClientTimeout(total=timeout or self.timeout),
+                ) as response:
+                    body = await response.text()
+                    raw = parse_response(body)
+                    raw["_http_status"] = response.status
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.policy.failure("network")
+                raise
+            reason = self._response_reason(raw)
+            if reason:
+                self.policy.failure(reason)
+                if reason == "authentication":
+                    self._clear_credentials()
+            elif self._classify(raw)["status"] == "success":
+                self.policy.success()
+            return raw
+
+    @staticmethod
+    async def _before_write(callback):
+        if callback is None:
+            return
+        try:
+            await callback()
+        except (asyncio.CancelledError, QzoneDeferred, AccountUnavailableError):
+            raise
+        except Exception:
+            raise _PreflightRejected() from None
+
+    @staticmethod
+    def _response_reason(raw):
+        http = number(raw.get("_http_status"), 200)
         nested = raw.get("data")
-        if (
-            response.status == 401
-            or result_code(raw) == -3000
-            or (isinstance(nested, dict) and number(nested.get("ret")) == -100)
+        if http == 401 or result_code(raw) == -3000 or (
+            isinstance(nested, dict) and number(nested.get("ret")) == -100
         ):
-            self._credentials = None
-        return raw
+            return "authentication"
+        if http in (403, 429):
+            return "restricted"
+        if http >= 500 or raw.get("_parse_error"):
+            return "service"
+        # Qzone also reports account-wide throttling and service saturation in
+        # ordinary HTTP 200 CGI errors. Keep unrelated per-post refusals local.
+        if result_code(raw) not in (None, 0):
+            message = str(raw.get("message") or raw.get("msg") or "")
+            if any(text in message for text in ("操作过于频繁", "请求过于频繁", "访问过于频繁")):
+                return "restricted"
+            if "使用人数过多" in message:
+                return "service"
+        return ""
 
     @staticmethod
     def _result(
@@ -281,16 +391,29 @@ class QzoneTransport:
         return self._result("success", tid=tid, created_at=number(raw.get("now")), code=code)
 
     async def _mutate(
-        self, url: str, *, params=None, data=None, tid: str = "", timeout=None
+        self, url: str, *, params=None, data=None, tid: str = "", timeout=None, context=None,
+        before_write=None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         import aiohttp
 
         try:
-            raw = await self._request("POST", url, params=params, data=data, timeout=timeout)
+            raw = await self._request(
+                "POST", url, params=params, data=data, timeout=timeout, context=context,
+                before_write=before_write,
+            )
         except asyncio.CancelledError:
             raise
-        except _CredentialsUnavailable:
+        except QzoneDeferred as exc:
+            return self._deferred_rejection(exc, tid), {}
+        except _PreflightRejected:
+            return self._result(
+                "rejected", tid=tid, message="发布条件已变化，本次操作尚未发送", stage="preflight",
+                retryable=False,
+            ), {}
+        except (_CredentialsUnavailable, AccountUnavailableError):
             return self._credential_rejection(tid), {}
+        except AccountIdentityError:
+            return self._credential_rejection(tid, temporary=False), {}
         except aiohttp.ClientConnectorError:
             # No HTTP connection was established, so this write was not sent.
             # Drop the stale connector; only the durable caller may retry later.
@@ -301,7 +424,8 @@ class QzoneTransport:
             except Exception:
                 self._http = None
             return self._result(
-                "rejected", tid=tid, message="空间连接未建立，本次操作尚未发送", stage="connect"
+                "rejected", tid=tid, message="空间连接未建立，本次操作尚未发送", stage="connect",
+                retryable=True, blocked=True, retry_at=self.policy.retry_at,
             ), {}
         except Exception:
             # Exception messages can contain signed URLs/cookies. Do not expose
@@ -309,17 +433,38 @@ class QzoneTransport:
             return self._result(
                 "unknown", tid=tid, message="请求未取得明确结果，请核对后再操作"
             ), {}
-        return self._classify(raw, tid=tid), raw
+        result = self._classify(raw, tid=tid)
+        reason = self._response_reason(raw)
+        result["retryable"] = result["status"] == "rejected" and bool(reason)
+        if reason:
+            result.update(blocked=True, retry_at=self.policy.retry_at, reason=reason)
+        return result, raw
 
-    async def _read(self, url: str, *, params=None) -> dict[str, Any]:
+    async def _read(self, url: str, *, params=None, context=None) -> dict[str, Any]:
         try:
-            raw = await self._request("GET", url, params=params)
+            raw = await self._request("GET", url, params=params, context=context)
         except asyncio.CancelledError:
             raise
+        except (AccountIdentityError, QzoneDeferred):
+            raise
         except Exception:
-            raise QzoneReadError("读取空间失败，未取得可靠结果") from None
+            if self.policy.retry_at <= self.policy._clock():
+                self.policy.failure("network")
+            raise QzoneDeferred(self.policy.reason, self.policy.retry_at) from None
+        reason = self._response_reason(raw)
+        if reason:
+            if self.policy.retry_at <= self.policy._clock():
+                self.policy.failure(reason)
+            raise QzoneDeferred(reason, self.policy.retry_at)
         result = self._classify(raw)
         if result["status"] != "success":
+            if (
+                url == self.DETAIL_URL and result_code(raw) not in (None, 0)
+                and any(text in result["message"] for text in (
+                    "该说说已删除", "该说说已被删除", "说说已被删除",
+                ))
+            ):
+                raise QzonePostDeletedError("空间已明确告知这条说说被删除")
             raise QzoneReadError(result["message"] or "读取空间失败")
         return raw
 
@@ -363,23 +508,55 @@ class QzoneTransport:
     async def publish(self, text: str, images: Any, *, before_publish=None) -> dict[str, Any]:
         try:
             context = await self._request_context()
-        except _CredentialsUnavailable:
+        except QzoneDeferred as exc:
+            return self._deferred_rejection(exc)
+        except (_CredentialsUnavailable, AccountUnavailableError):
             return self._credential_rejection()
+        except AccountIdentityError:
+            return self._credential_rejection(temporary=False)
         if isinstance(images, (str, bytes, os.PathLike)):
             images = [images]
         images = list(images or [])
         if not str(text or "").strip() and not images:
             return self._result("rejected", message="说说内容不能为空")
+        if len(images) > 9:
+            return self._result("rejected", message="单条说说最多使用九张照片")
         try:
-            # Read every image before uploading anything. Never silently drop a
-            # missing file and accidentally send a different or text-only post.
-            payloads = [await self._load_image(source) for source in images]
-        except asyncio.CancelledError:
-            raise
+            if self.staging_dir is not None:
+                self.staging_dir.mkdir(parents=True, exist_ok=True)
+            staging = tempfile.TemporaryDirectory(
+                prefix="qzone-upload-", dir=self.staging_dir, ignore_cleanup_errors=True,
+            )
         except Exception:
             return self._result("rejected", message="图片读取失败，尚未发布说说")
+        with staging as directory:
+            prepared = []
+            try:
+                # Preserve a validated immutable snapshot of every image before
+                # uploading any. Only one decoded file's bytes stay in memory.
+                for index, source in enumerate(images):
+                    payload = await self._load_image(source)
+                    path = Path(directory) / str(index)
+                    await asyncio.to_thread(path.write_bytes, payload)
+                    prepared.append(path)
+                    del payload
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return self._result("rejected", message="图片读取失败，尚未发布说说")
+            return await self._publish_prepared(context, text, prepared, before_publish)
+
+    async def _publish_prepared(self, context, text, prepared, before_publish):
         pic_bos, richvals = [], []
-        for payload in payloads:
+        for path in prepared:
+            try:
+                payload = await self._load_image(path)
+                encoded = base64.b64encode(payload).decode("ascii")
+                del payload
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return self._result("rejected", message="图片读取失败，尚未发布说说", stage="upload")
             result, raw = await self._mutate(
                 self.UPLOAD_URL,
                 data={
@@ -391,13 +568,17 @@ class QzoneTransport:
                     "p_skey": context.p_skey,
                     "output_type": "json",
                     "base64": "1",
-                    "picfile": base64.b64encode(payload).decode("ascii"),
+                    "picfile": encoded,
                 },
-                timeout=max(self.timeout, 60),
+                timeout=max(self.timeout, 60), context=context,
             )
+            del encoded
             if result["status"] != "success":
                 return self._result(
-                    "rejected", message="图片上传未完成，尚未发布说说", stage="upload"
+                    "rejected", message="图片上传未完成，尚未发布说说", stage="upload",
+                    retryable=result.get("retryable", True),
+                    blocked=result.get("blocked", False), retry_at=result.get("retry_at", 0),
+                    access_wait=result.get("access_wait", False),
                 )
             try:
                 picbo, richval = upload_fields(raw)
@@ -421,19 +602,11 @@ class QzoneTransport:
             "format": "json",
             "qzreferrer": f"{self.BASE}/{context.uin}",
         }
-        if payloads:
+        if prepared:
             data.update(pic_bo=",".join(pic_bos), richtype="1", richval="\t".join(richvals))
-        if before_publish is not None:
-            try:
-                await before_publish()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                return self._result(
-                    "rejected", message="发布条件已变化，本次说说尚未发送", stage="preflight"
-                )
         result, raw = await self._mutate(
-            self.PUBLISH_URL, params={"g_tk": context.gtk, "uin": context.uin}, data=data
+            self.PUBLISH_URL, params={"g_tk": context.gtk, "uin": context.uin}, data=data,
+            context=context, before_write=before_publish,
         )
         if result["status"] == "success":
             nested = raw.get("data") if isinstance(raw.get("data"), dict) else {}
@@ -457,6 +630,7 @@ class QzoneTransport:
         limit = max(1, min(int(limit), 100))
         raw = await self._read(
             self.LIST_URL,
+            context=context,
             params={
                 "g_tk": context.gtk,
                 "uin": context.uin,
@@ -490,6 +664,7 @@ class QzoneTransport:
         context = await self._get_context()
         raw = await self._read(
             self.DETAIL_URL,
+            context=context,
             params={"uin": context.uin, "tid": tid, "format": "jsonp", "g_tk": context.gtk},
         )
         source = raw
@@ -504,15 +679,21 @@ class QzoneTransport:
             raise QzoneReadError("空间详情与请求的帖子不一致")
         return post
 
-    async def like(self, tid: str) -> dict[str, Any]:
+    async def like(self, tid: str, *, before_write=None) -> dict[str, Any]:
         tid = self._tid(tid)
         try:
             context = await self._request_context()
-        except _CredentialsUnavailable:
+        except QzoneDeferred as exc:
+            return self._deferred_rejection(exc, tid)
+        except (_CredentialsUnavailable, AccountUnavailableError):
             return self._credential_rejection(tid)
+        except AccountIdentityError:
+            return self._credential_rejection(tid, temporary=False)
         mood = f"http://user.qzone.qq.com/{context.uin}/mood/{tid}"
         result, _ = await self._mutate(
             self.LIKE_URL,
+            context=context,
+            before_write=before_write,
             params={"g_tk": context.gtk},
             data={
                 "qzreferrer": f"{self.BASE}/{context.uin}",
@@ -532,14 +713,20 @@ class QzoneTransport:
         )
         return result
 
-    async def delete(self, tid: str) -> dict[str, Any]:
+    async def delete(self, tid: str, *, before_write=None) -> dict[str, Any]:
         tid = self._tid(tid)
         try:
             context = await self._request_context()
-        except _CredentialsUnavailable:
+        except QzoneDeferred as exc:
+            return self._deferred_rejection(exc, tid)
+        except (_CredentialsUnavailable, AccountUnavailableError):
             return self._credential_rejection(tid)
+        except AccountIdentityError:
+            return self._credential_rejection(tid, temporary=False)
         result, _ = await self._mutate(
             self.DELETE_URL,
+            context=context,
+            before_write=before_write,
             params={"g_tk": context.gtk},
             data={
                 "uin": context.uin,
@@ -561,12 +748,16 @@ class QzoneTransport:
         )
         return result
 
-    async def reply(self, tid: str, comment: dict[str, Any], text: str) -> dict[str, Any]:
+    async def reply(self, tid: str, comment: dict[str, Any], text: str, *, before_write=None) -> dict[str, Any]:
         tid = self._tid(tid)
         try:
             context = await self._request_context()
-        except _CredentialsUnavailable:
+        except QzoneDeferred as exc:
+            return self._deferred_rejection(exc, tid)
+        except (_CredentialsUnavailable, AccountUnavailableError):
             return self._credential_rejection(tid)
+        except AccountIdentityError:
+            return self._credential_rejection(tid, temporary=False)
         target_uin = number(comment.get("uin"))
         if target_uin <= 0 or target_uin == context.uin:
             return self._result("rejected", tid=tid, message="回复对象无效或为机器人自身")
@@ -592,6 +783,8 @@ class QzoneTransport:
         content = f"@{{uin:{target_uin},nick:{nickname},auto:1}} {content}"
         result, raw = await self._mutate(
             self.REPLY_URL,
+            context=context,
+            before_write=before_write,
             params={"g_tk": context.gtk},
             data={
                 "hostUin": context.uin,

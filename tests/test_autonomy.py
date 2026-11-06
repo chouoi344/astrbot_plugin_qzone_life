@@ -9,6 +9,8 @@ import test_service as fixtures
 
 from astrbot_plugin_qzone_life.core.autonomy import run_autonomous
 from astrbot_plugin_qzone_life.core.store import StateStore
+from astrbot_plugin_qzone_life.core.request_policy import QzoneDeferred
+from astrbot_plugin_qzone_life.core.transport import AccountIdentityError, AccountUnavailableError
 
 
 class AutonomyTests(IsolatedAsyncioTestCase):
@@ -308,6 +310,76 @@ class AutonomyTests(IsolatedAsyncioTestCase):
         await self.run_due()
         self.assertEqual(self.store.get_plan("binding")["last_error_kind"], "binding_changed")
         self.transport.publish.assert_not_awaited()
+
+    async def test_temporary_disconnect_after_selfie_preserves_opportunity_and_image(self):
+        self.seed_due_plan("disconnected", 60)
+
+        async def generated(*args):
+            self.transport.identity.side_effect = AccountUnavailableError("QQ temporarily offline")
+            return self.photo, {}
+
+        self.integrations.selfie.side_effect = generated
+        with self.assertRaises(AccountUnavailableError):
+            await self.run_due()
+        saved = self.store.get_plan("disconnected")
+        self.assertEqual((saved["status"], saved["attempt_count"]), ("pending", 0))
+        self.assertEqual(saved["cached_image_path"], str(self.photo))
+        self.transport.identity.side_effect = None
+        self.now += timedelta(minutes=1)
+        await self.run_due()
+        self.integrations.selfie.assert_awaited_once()
+        self.transport.publish.assert_awaited_once()
+        self.assertEqual(self.store.get_plan("disconnected")["status"], "done")
+
+    async def test_access_wait_before_publish_keeps_immutable_draft_and_retry_budget(self):
+        self.seed_due_plan("access-wait", 60)
+        self.transport.publish.side_effect = [
+            self.result(status="rejected", stage="upload", access_wait=True,
+                        retry_at=self.now.timestamp() + 900),
+            self.result(tid="after-recovery"),
+        ]
+        with self.assertRaises(QzoneDeferred):
+            await self.run_due()
+        draft = self.store.get_operation("auto:access-wait")["payload"]
+        saved = self.store.get_plan("access-wait")
+        self.assertEqual((saved["status"], saved["attempt_count"]), ("pending", 0))
+        self.now += timedelta(minutes=14)
+        await self.run_due()
+        self.transport.publish.assert_awaited_once()
+        self.now += timedelta(minutes=1)
+        await self.run_due()
+        self.integrations.selfie.assert_awaited_once()
+        self.service.photo_summary.assert_awaited_once()
+        self.service.llm.assert_awaited_once()
+        self.assertEqual(self.store.get_operation("auto:access-wait")["payload"], draft)
+        self.assertEqual(self.store.get_plan("access-wait")["status"], "done")
+
+    async def test_explicit_account_mismatch_still_cancels_generated_opportunity(self):
+        self.seed_due_plan("wrong-account", 60)
+
+        async def generated(*args):
+            self.transport.identity.side_effect = AccountIdentityError("different account")
+            return self.photo, {}
+
+        self.integrations.selfie.side_effect = generated
+        await self.run_due()
+        self.assertEqual(self.store.get_plan("wrong-account")["last_error_kind"], "binding_changed")
+        self.assertEqual(self.store.get_plan("wrong-account")["status"], "cancelled")
+        self.transport.publish.assert_not_awaited()
+
+    async def test_persona_change_cancels_waiting_opportunity_before_recovery(self):
+        self.seed_due_plan("old-persona", 60)
+        self.transport.publish.return_value = self.result(
+            status="rejected", stage="cooldown", access_wait=True,
+            retry_at=self.now.timestamp() + 60,
+        )
+        with self.assertRaises(QzoneDeferred):
+            await self.run_due()
+        self.integrations.binding["persona_id"] = "new-role"
+        await self.service.refresh_binding(self.event)
+        self.assertEqual(self.store.get_plan("old-persona")["status"], "cancelled")
+        self.integrations.selfie.assert_awaited_once()
+        self.transport.publish.assert_awaited_once()
 
     async def test_success_quota_including_deleted_posts_blocks_generation(self):
         self.seed_due_plan("quota", 60)
