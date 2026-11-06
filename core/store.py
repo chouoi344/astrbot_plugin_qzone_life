@@ -490,14 +490,25 @@ class StateStore:
             self._save_post(post, now)
             return _copy(post)
 
-    def list_posts(self, limit: int = 20, include_deleted: bool = False) -> list[dict]:
+    def list_posts(
+        self, limit: int = 20, include_deleted: bool = False, *,
+        bot_id: str | None = None, persona_id: str | None = None,
+    ) -> list[dict]:
         """Return newest publications; deleted facts remain available on request."""
-        sql = "SELECT record_json FROM posts"
+        conditions, args = [], []
         if not include_deleted:
-            sql += " WHERE status='published'"
+            conditions.append("status='published'")
+        for field, value in (("bot_id", bot_id), ("persona_id", persona_id)):
+            if value is not None:
+                conditions.append(f"CAST(json_extract(record_json, '$.binding.{field}') AS TEXT)=?")
+                args.append(str(value))
+        sql = "SELECT record_json FROM posts"
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY published_at DESC,tid LIMIT ?"
+        args.append(max(0, limit))
         with self._lock:
-            return [json.loads(row[0]) for row in self._db.execute(sql, (max(0, limit),))]
+            return [json.loads(row[0]) for row in self._db.execute(sql, args)]
 
     def count_autonomous(self, local_day: str, bot_id: str | None = None) -> int:
         """Count successful autonomous publications, including later-deleted ones."""
@@ -518,7 +529,8 @@ class StateStore:
                 return None
 
     def list_comments(
-        self, tid: str | None = None, limit: int = 100, status: str | None = None
+        self, tid: str | None = None, limit: int = 100, status: str | None = None, *,
+        bot_id: str | None = None, persona_id: str | None = None,
     ) -> list[dict]:
         """Return recent comments chronologically, optionally across posts/by status."""
         conditions, args = [], []
@@ -528,6 +540,10 @@ class StateStore:
         if status is not None:
             conditions.append("status=?")
             args.append(status)
+        for field, value in (("bot_id", bot_id), ("persona_id", persona_id)):
+            if value is not None:
+                conditions.append(f"CAST(json_extract(record_json, '$.binding.{field}') AS TEXT)=?")
+                args.append(str(value))
         sql = "SELECT record_json FROM comments"
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
@@ -539,7 +555,7 @@ class StateStore:
 
     def set_comment_status(self, key: str, status: str, error: str | None = None) -> None:
         """Set workflow state without fabricating a reply or memory event."""
-        if status not in ("pending", "processing", "failed", "uncertain", "cancelled", "replied"):
+        if status not in ("pending", "processing", "failed", "failed_exhausted", "uncertain", "cancelled", "replied"):
             raise ValueError("Invalid comment status")
         with self._lock, self._db:
             comment = self._comment(key)
@@ -658,6 +674,31 @@ class StateStore:
                     time.time(),
                     event_key,
                 ),
+            )
+
+    def defer_outbox(
+        self, event_key: str, error: str, next_attempt_at: float, *, refund_attempt: bool = False
+    ) -> None:
+        """Postpone a self-like before sending without spending its retry budget.
+
+        A refund is allowed only for the current running claim whose caller has
+        established that no HTTP write was sent. Terminal/uncertain work stays put.
+        """
+        with self._lock, self._db:
+            self._db.execute(
+                "UPDATE outbox SET status='pending',error=?,next_attempt_at=?,updated_at=?,"
+                "attempts=MAX(0,attempts-CASE WHEN status='running' AND ? THEN 1 ELSE 0 END) "
+                "WHERE event_key=? AND kind='self_like' AND status IN ('pending','reconcile','running')",
+                (str(error), next_attempt_at, time.time(), bool(refund_attempt), event_key),
+            )
+
+    def stop_outbox(self, event_key: str, reason: str, *, uncertain: bool = False) -> None:
+        """End low-value self-like work without recording a successful action."""
+        with self._lock, self._db:
+            self._db.execute(
+                "UPDATE outbox SET status=?,error=?,result_json=NULL,updated_at=? "
+                "WHERE event_key=? AND kind='self_like' AND status IN ('pending','reconcile','running')",
+                ("uncertain" if uncertain else "cancelled", str(reason), time.time(), event_key),
             )
 
     def save_plan(self, plan: dict) -> dict:
@@ -818,6 +859,34 @@ class StateStore:
             self._write_plan(plan, time.time())
             return _copy(plan)
 
+    def defer_plan(self, plan_id: str, *, retry_at: float, now: float) -> dict:
+        """Wait for account access without spending a generation attempt or losing media."""
+        with self._lock, self._db:
+            plan = self.get_plan(plan_id)
+            if plan is None:
+                raise KeyError(plan_id)
+            operation = self.get_operation("auto:" + plan_id)
+            if operation and operation["status"] in ("inflight", "uncertain", "done"):
+                self._sync_auto_plan(
+                    operation["key"],
+                    "uncertain" if operation["status"] == "inflight" else operation["status"],
+                    operation.get("result"), time.time(),
+                )
+                return self.get_plan(plan_id)
+            if plan["status"] not in ("running", "failed"):
+                return plan
+            expires = float(plan.get("expires_at", float(plan["slot_at"]) + 3600))
+            plan.update(
+                attempt_count=max(0, int(plan.get("attempt_count", 0)) - 1),
+                last_error_kind="account_waiting",
+                next_attempt_at=max(now, retry_at), status="pending", stage="access_wait",
+            )
+            if plan["next_attempt_at"] >= expires:
+                plan.update(status="skipped", stage="skipped", next_attempt_at=None,
+                            last_error_kind="opportunity_expired")
+            self._write_plan(plan, time.time())
+            return _copy(plan)
+
     def finish_plan(self, plan_id: str, status: str, post_tid: str | None = None) -> dict:
         """Save a terminal result; cannot silently reset a plan to pending/running."""
         if status not in ("done", "failed", "cancelled", "uncertain", "skipped"):
@@ -897,7 +966,7 @@ class StateStore:
     set_kv = set_value
 
     def recover_interrupted(self) -> dict:
-        """Recover after workers stop: uncertain actions, reconciled memories, safe likes.
+        """Recover uncertain writes and reconcile idempotent memory events.
 
         This is explicit rather than a constructor side effect, so merely opening
         a second connection cannot interrupt a live worker.
@@ -910,7 +979,7 @@ class StateStore:
                 "updated_at=? WHERE status='inflight'",
                 (now,),
             ).rowcount
-            for kind, state in (("memory", "reconcile"), ("self_like", "pending")):
+            for kind, state in (("memory", "reconcile"), ("self_like", "uncertain")):
                 counts[kind] = self._db.execute(
                     "UPDATE outbox SET status=?,next_attempt_at=?,updated_at=? "
                     "WHERE kind=? AND status='running'",
